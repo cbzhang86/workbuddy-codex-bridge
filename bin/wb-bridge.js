@@ -11,6 +11,7 @@ import path from "node:path";
 import http from "node:http";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
+import os from "node:os";
 import { DEFAULT_PORT, DEFAULT_HOST, MODEL_PREFIX, OFFICIAL_CODEX_BASE } from "../src/constants.js";
 import { discoverCredential, ensureFreshCredential, oauthLogin, classifyUpstream } from "../src/credentials.js";
 import { requestThroughProxy } from "../src/proxy.js";
@@ -40,6 +41,59 @@ function arg(flag, fallback) {
 }
 function has(flag) { return process.argv.includes(flag); }
 function log(...a) { console.log(...a); }
+
+// The Codex plugin is materialised into ~/.codex/plugins/cache/..., a copy with
+// no link back to this checkout. Record where the checkout lives so the plugin's
+// MCP server can start the gateway without being told. Best effort: a read-only
+// or missing home directory must not stop the bridge.
+function recordInstall() {
+  try {
+    const dir = path.join(os.homedir(), ".wb-bridge");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "install.json"),
+      `${JSON.stringify({ root: ROOT, version: "1.1.0", updatedAt: new Date().toISOString() }, null, 2)}\n`,
+    );
+  } catch { /* not fatal */ }
+}
+
+// The plugin server starts this process detached so it survives the app closing,
+// which leaves the pid in this file. Writing it (and clearing it on exit) lets
+// the next plugin start adopt a live gateway instead of spawning a second one.
+const PID_FILE = path.join(os.homedir(), ".wb-bridge", "gateway.pid");
+function recordPid() {
+  try {
+    fs.mkdirSync(path.dirname(PID_FILE), { recursive: true });
+    fs.writeFileSync(PID_FILE, String(process.pid));
+  } catch { /* not fatal */ }
+}
+function clearPid() {
+  try {
+    if (fs.readFileSync(PID_FILE, "utf8").trim() === String(process.pid)) fs.unlinkSync(PID_FILE);
+  } catch { /* not fatal */ }
+}
+
+// A detached gateway must not outlive the user's enrolment: if the plugin is
+// switched off there is nobody to stop it, so the gateway stops itself. Only
+// armed when the plugin spawns us (WB_BRIDGE_PLUGIN_GUARD=1) -- a manual
+// `wb-bridge start` is the user's own business and must never be shot down.
+function watchPluginSwitch(config) {
+  if (process.env.WB_BRIDGE_PLUGIN_GUARD !== "1") return;
+  const timer = setInterval(() => {
+    try {
+      const home = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+      const text = fs.readFileSync(path.join(home, "config.toml"), "utf8");
+      const block = /\[plugins\."wb-bridge@[^"]*"\]([^[]*)/u.exec(text);
+      if (!block || /enabled\s*=\s*true/u.test(block[1])) return;
+      log("\n  plugin switched off; restoring the Codex config and stopping");
+      clearInterval(timer);
+      try { restoreConfig(); } catch { /* best effort */ }
+      clearPid();
+      process.exit(0);
+    } catch { /* config unreadable -> keep serving */ }
+  }, 15000);
+  timer.unref();
+}
 
 // Resolve the upstream model id from a Codex model slug ("wb/hy3" -> "hy3").
 function stripPrefix(model) {
@@ -416,6 +470,9 @@ async function cmdStart(config) {
   const ctx = await ensureSetup(config);
   const server = createServer(config, ctx);
   server.listen(config.port, config.host, () => {
+    recordInstall();
+    recordPid();
+    watchPluginSwitch(config);
     log(`\n  workbuddy-codex-bridge listening on http://${config.host}:${config.port}/v1`);
     log(`  WorkBuddy models : ${ctx.models.length}`);
     log(`  Native GPT       : forwarded to ${OFFICIAL_CODEX_BASE} (0-step rollback)`);
@@ -430,8 +487,10 @@ async function cmdStart(config) {
     log,
     handleCreate: (msg, sink, _signal, headers) => handleWsCreate(msg, sink, config, ctx, headers),
   });
-  const stop = () => { server.close(() => process.exit(0)); };
+  const stop = () => { clearPid(); server.close(() => process.exit(0)); };
   process.on("SIGINT", stop); process.on("SIGTERM", stop);
+  // A detached gateway is killed with taskkill, which does not raise a signal.
+  process.on("exit", clearPid);
 }
 
 // ---------------------------------------------------------------------------

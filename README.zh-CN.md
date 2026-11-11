@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](#给开发者)
-[![Tests](https://img.shields.io/badge/tests-36%20passing-success.svg)](#自检)
+[![Tests](https://img.shields.io/badge/tests-47%20passing-success.svg)](#自检)
 [![Rollback](https://img.shields.io/badge/回退-0%20步%20%7C%201%20条命令-blue.svg)](#怎么回退)
 [![Status](https://img.shields.io/badge/status-实验性-orange.svg)](#常见问题)
 
@@ -61,6 +61,35 @@ node bin/wb-bridge.js start
 重新打开，切到 **Codex 模式**，点开模型下拉框。你会看到 `WB · GLM-5.3 · x0.69` 这样的条目跟 GPT 排在一起。选一个，直接打字。
 
 就这样，三步，没有改配置这一环。
+
+---
+
+## 不想开终端：装成插件，用开关控制
+
+不想一直留着一个命令行窗口的话，把这个仓库注册成 Codex 的 marketplace（只做一次），以后就在**插件设置**里用一个开关控制它，不用敲命令。
+
+```bash
+git clone https://github.com/<you>/workbuddy-codex-bridge.git
+cd workbuddy-codex-bridge
+codex plugin marketplace add .
+codex plugin add wb-bridge@workbuddy-bridge
+```
+
+然后打开 ChatGPT 桌面端 → 设置 → 插件，里面会有 `WorkBuddy Bridge` 和它的开关。
+
+| 开关 | 会发生什么 |
+| --- | --- |
+| **打开** | Codex 启动插件自带的辅助进程，它把网关拉起来，`WB ·` 模型就出现在下拉框里。 |
+| **关闭** | 网关停掉，**并且**把你的 `config.toml` 还原成和原来一模一样，所以官方 GPT 模型照常能用。 |
+
+切换开关之后要完全退出重开 App，和上面一样 —— 模型列表只在启动时读一次。
+
+> [!NOTE]
+> 「关掉 App」和「关掉插件开关」不是一回事，这两种情况是**故意**分开处理的。只关 App 的话，网关会继续跑着，因为 App 是**先**读 `config.toml`、**再**启动插件的 —— 每次退出都拆掉的话，`WB ·` 模型会隔次消失。只有关掉插件开关才会完整回退。
+>
+> 如果你在 App 关着的时候翻转开关，网关会自己在大约 15 秒内发现，然后把配置还原，不用再开一次 App。这个自我了断只在网关由插件启动时生效；你在终端里手动起的网关归你管，它不会碰。过程写到 `~/.wb-bridge/plugin.log`。
+
+装好之后可以直接问助手「WorkBuddy 网关还在跑吗」，它能调用插件自带的工具去查状态、列模型，或者一键还原。
 
 ---
 
@@ -295,7 +324,7 @@ openai_base_url = "http://127.0.0.1:10100/v1"
 <summary><b>自检</b></summary>
 
 ```bash
-npm test     # 36 项 —— 协议、改写、请求头、SSE、WS 帧、代理、配置可逆性
+npm test     # 47 项 —— 协议、改写、请求头、SSE、WS 帧、代理、插件生命周期、配置可逆性
 ```
 
 一半是纯函数；另一半在临时 `CODEX_HOME` 里跑「注入 → 重复注入（幂等）→ 还原」，并断言字节级可逆。
@@ -311,6 +340,8 @@ npm test     # 36 项 —— 协议、改写、请求头、SSE、WS 帧、代理
 - **`model_catalog_json` 只在启动时加载，且是替换不是合并。** 本项目克隆原生行来补偿，但每次改配置都要完全重开 App。
 - **上游只支持流式。** 非流式请求会被拒（`11101`），需要缓冲时网关本地聚合。
 - **协议会漂移。** 上游限流、头要求、内容审核随时可能变。
+- **插件开关是「假钩子」。** 这个版本 Codex 把 `plugin_hooks` 标成 `removed`，所以插件自带的 MCP 服务器顶替了生命周期钩子：Codex 开会话时拉起它、结束会话时杀掉它。但 `codex exec` **不会**拉起插件，所以一次性 CLI 场景下这个开关没意义，请用 `wb-bridge start`。
+- **关开关是靠轮询发现的。** 如果 App 关着的时候把插件关掉，网关靠每 15 秒读一次 `config.toml` 才发现。这期间不会出错，只是网关会多活几秒。
 
 </details>
 

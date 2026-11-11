@@ -5,6 +5,56 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-11-12
+
+### Added
+
+- **Installable Codex plugin.** The repository now ships a marketplace manifest at
+  `.agents/plugins/marketplace.json` and a plugin at `plugin/`, so
+  `codex plugin marketplace add . && codex plugin add wb-bridge@workbuddy-bridge`
+  installs it. Once installed, the bridge is controlled from the app's plugin
+  settings: enabling the plugin starts the gateway, disabling it stops the gateway
+  and restores `config.toml` so the official models keep working.
+- **Plugin MCP server** (`plugin/mcp-server.js`, zero dependencies,
+  newline-delimited JSON-RPC over stdio) exposing `wb_status`, `wb_models` and
+  `wb_restore`. This is the lifecycle hook in disguise: this build reports
+  `plugin_hooks` as `removed`, so a plugin-provided MCP server is the only hook
+  point Codex offers.
+- **Plugin skill** (`plugin/skills/workbuddy-bridge/SKILL.md`) so the assistant
+  can diagnose a broken bridge, list models, or roll back when asked.
+- `wb-bridge start` records its checkout in `~/.wb-bridge/install.json`, because a
+  plugin materialised into `~/.codex/plugins/cache/` cannot find the original
+  checkout by walking up from its own path.
+- **The gateway outlives the app.** It is spawned detached and records its pid in
+  `~/.wb-bridge/gateway.pid`, so closing the app no longer leaves the injected
+  `config.toml` pointing at a closed port. The next plugin start adopts the
+  running gateway instead of spawning a second one.
+
+### Fixed
+
+- **Closing the app tore down the bridge, so the `WB ·` models appeared on every
+  other launch.** Codex reads `config.toml` before it spawns the plugin, so
+  teardown is now split: closing the app keeps the gateway and the injected
+  config, while flipping the plugin switch off does the full restore.
+- **A detached gateway could outlive the user's enrolment.** When the plugin is
+  switched off while the app is closed, the gateway notices within ~15s, restores
+  the config and exits. The watchdog is armed only for gateways the plugin
+  spawned, so a hand-started gateway is never shot down.
+- **Stopping the plugin left `config.toml` pointing at a dead port**, which took
+  the *native GPT models* down with it. Teardown now runs `wb-bridge restore`
+  before exiting, and releases ownership first so the exit hook does not restore
+  twice.
+- **A gateway that died mid-session stayed dead.** It is now restarted while the
+  plugin is enabled; an initial start that never becomes healthy restores the
+  config instead, rather than leaving a broken pointer behind.
+- **Responses were dropped when stdin closed.** The server tracked in-flight
+  requests and waits for them before exiting.
+- **Gateway output was discarded**, making a failed start undiagnosable. It now
+  goes to `~/.wb-bridge/gateway.log` and the tail is included in `wb_status`
+  failures.
+- **`wb_status`/`wb_models` reported a false negative** while the gateway was
+  still booting; both now await the in-flight start.
+
 ## [1.1.0] - 2026-11-11
 
 ### Added

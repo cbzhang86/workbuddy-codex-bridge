@@ -461,4 +461,139 @@ t("proxy: bypasses NO_PROXY hosts", () => {
   assert.equal(PX.bypassProxy("chatgpt.com", env), false);
 });
 
+// --- plugin ----------------------------------------------------------------
+// The plugin is what makes "toggle it in the Codex plugin settings" work, so
+// its manifest and lifecycle wiring are worth asserting. Nothing here spawns
+// the gateway; these are structural checks on the files Codex reads.
+const pluginRoot = path.join(ROOT, "plugin");
+const readJson = (rel) => JSON.parse(fs.readFileSync(path.join(pluginRoot, rel), "utf8"));
+
+t("plugin: manifest declares the name Codex keys installs on", () => {
+  const manifest = readJson(".codex-plugin/plugin.json");
+  assert.equal(manifest.name, "wb-bridge");
+  assert.match(manifest.name, /^[a-z][a-z0-9-]*$/u);
+  assert.equal(manifest.mcpServers, "./.mcp.json");
+});
+
+t("plugin: marketplace entry points at the plugin directory", () => {
+  const marketplace = JSON.parse(fs.readFileSync(path.join(ROOT, ".agents/plugins/marketplace.json"), "utf8"));
+  const entry = marketplace.plugins.find((p) => p.name === "wb-bridge");
+  assert.ok(entry, "wb-bridge missing from the marketplace");
+  assert.equal(entry.source.path, "./plugin");
+  // Codex rejects any source path that escapes the marketplace root.
+  assert.ok(!entry.source.path.includes(".."), "source path must stay inside the root");
+});
+
+t("plugin: MCP manifest launches the server that is actually present", () => {
+  const mcp = readJson(".mcp.json");
+  const server = mcp.mcpServers["wb-bridge"];
+  assert.equal(server.command, "node");
+  const target = path.resolve(pluginRoot, server.args[0]);
+  assert.ok(fs.existsSync(target), `missing ${target}`);
+});
+
+t("plugin: every declared tool is dispatched, and unknown tools fail loudly", () => {
+  const source = fs.readFileSync(path.join(pluginRoot, "mcp-server.js"), "utf8");
+  for (const name of ["wb_status", "wb_models", "wb_restore"]) {
+    assert.match(source, new RegExp(`name: "${name}"`, "u"), `${name} not declared`);
+    assert.match(source, new RegExp(`name === "${name}"`, "u"), `${name} not dispatched`);
+  }
+  assert.match(source, /unknown tool/u);
+});
+
+t("plugin: teardown restores the config exactly once", () => {
+  const source = fs.readFileSync(path.join(pluginRoot, "mcp-server.js"), "utf8");
+  // stopGateway() runs from both maybeExit() and the process exit hook. It has
+  // to release `owned` before restoring, otherwise the config gets rewritten
+  // twice and the second pass races the first.
+  const body = source.slice(source.indexOf("function stopGateway()"), source.indexOf("/** Last lines of the gateway"));
+  assert.match(body, /owned = false;/u, "stopGateway must release ownership");
+  const ownerless = body.slice(body.indexOf("owned = false;"));
+  assert.match(ownerless, /"restore"/u, "restore must happen after ownership is released");
+});
+
+t("plugin: restore is skipped while the gateway is still starting", () => {
+  const source = fs.readFileSync(path.join(pluginRoot, "mcp-server.js"), "utf8");
+  // A failed start must not leave config.toml aimed at a dead port.
+  assert.match(source, /restoring the Codex config/u);
+  assert.match(source, /restarting it/u);
+});
+
+t("plugin: resolves the checkout from the marketplace source in config.toml", () => {
+  const source = fs.readFileSync(path.join(pluginRoot, "mcp-server.js"), "utf8");
+  // "Install the plugin and never open a terminal" only works if the checkout
+  // can be recovered from Codex's own config: install.json is written by the
+  // bridge itself, so it does not exist on a fresh plugin-only install.
+  assert.match(source, /function marketplaceRoots/u);
+  assert.match(source, /\[marketplaces\./u);
+  assert.match(source, /source_type/u);
+  // Codex records Windows paths with an extended-length prefix.
+  assert.match(source, /\\\\\\\?/u, "must strip the \\\\?\\ prefix Codex writes");
+});
+
+t("plugin: findRoot prefers an explicit override, then install.json, then config", () => {
+  const source = fs.readFileSync(path.join(pluginRoot, "mcp-server.js"), "utf8");
+  const body = source.slice(source.indexOf("function findRoot()"), source.indexOf("function marketplaceRoots"));
+  const order = ["WB_BRIDGE_HOME", "INSTALL_FILE", "marketplaceRoots()", "process.cwd()"].map((token) => {
+    const at = body.indexOf(token);
+    assert.ok(at >= 0, `${token} missing from findRoot`);
+    return at;
+  });
+  assert.deepEqual(order, [...order].sort((a, b) => a - b), "findRoot resolved sources out of order");
+});
+
+t("plugin: the two teardown paths are told apart by the stored switch", () => {
+  const source = fs.readFileSync(path.join(pluginRoot, "mcp-server.js"), "utf8");
+  const body = source.slice(source.indexOf("function stopGateway()"));
+  // Closing the app keeps everything; only an explicit opt-out tears down.
+  // Getting this backwards makes the WB models appear on alternate launches.
+  assert.match(body, /if \(pluginStillEnabled\(\)\)/u);
+  const keeps = body.slice(body.indexOf("pluginStillEnabled()"), body.indexOf("stopping gateway because the plugin is switched off"));
+  assert.match(keeps, /leaving the gateway and the Codex config in place/u);
+  assert.ok(!/restore/u.test(keeps), "the keep path must not restore the config");
+  // The gateway is detached so it survives the app closing; the pid file lets
+  // the next launch adopt it rather than start a second one.
+  assert.match(source, /detached: true/u);
+  assert.match(source, /child\.unref\(\)/u);
+});
+
+t("gateway: records its pid and self-stops only when it was plugin-spawned", () => {
+  const source = fs.readFileSync(path.join(ROOT, "bin", "wb-bridge.js"), "utf8");
+  assert.match(source, /function recordPid/u);
+  assert.match(source, /gateway\.pid/u);
+  // An opted-out plugin leaves no plugin server alive to run the teardown, so
+  // the detached gateway has to notice by itself.
+  const guard = source.slice(source.indexOf("function watchPluginSwitch"), source.indexOf("function stripPrefix"));
+  assert.match(guard, /WB_BRIDGE_PLUGIN_GUARD/u, "the watchdog must be opt-in");
+  assert.match(guard, /restoreConfig\(\)/u, "the watchdog must restore the config");
+  assert.match(guard, /clearPid\(\)/u, "the watchdog must clear the pid file");
+});
+
+await tAsync("config: restore never deletes a catalog the config still points at", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wb-bridge-catalog-"));
+  const prev = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = tmp;
+  try {
+    const CR2 = await import(`${href("src/codex-config.js")}?catalog`);
+    const models = [{ id: "hy3", name: "Hy3", contextWindow: 192000 }];
+    fs.writeFileSync(CR2.configPath(), 'model = "gpt-6.1-terra"\n\n[marketplaces.openai-bundled]\nenabled = true\n', "utf8");
+    CR2.writeCatalog(models);
+    CR2.injectConfig({ port: 10100, catalogFile: CR2.catalogPath() });
+    assert.ok(fs.existsSync(CR2.catalogPath()), "catalog must exist after inject");
+
+    // Simulate the failure that actually bit: a stale backup still carrying the
+    // model_catalog_json line. Deleting a referenced file makes Codex reject its
+    // whole config, which takes the official models down as well.
+    CR2.restoreConfig();
+    const after = fs.readFileSync(path.join(tmp, "config.toml"), "utf8");
+    if (after.includes("workbuddy-catalog.json")) {
+      assert.ok(fs.existsSync(CR2.catalogPath()), "a referenced catalog must survive restore");
+    }
+  } finally {
+    if (prev === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 console.log(`\n${passed} checks passed.`);

@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](#for-developers)
-[![Tests](https://img.shields.io/badge/tests-36%20passing-success.svg)](#self-check)
+[![Tests](https://img.shields.io/badge/tests-47%20passing-success.svg)](#self-check)
 [![Rollback](https://img.shields.io/badge/rollback-0%20steps%20%7C%201%20command-blue.svg)](#going-back)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#troubleshooting)
 
@@ -61,6 +61,35 @@ That single command finds your subscription, reads the model list, registers eve
 Reopen it, switch to **Codex mode**, and open the model dropdown. You will see entries like `WB · GLM-5.3 · x0.69` alongside your usual GPT models. Pick one and type.
 
 That's it — three steps, no config editing.
+
+---
+
+## The no-terminal way: install it as a plugin
+
+If you would rather not keep a terminal window open, register this repository as a Codex marketplace once and then control the bridge from the **plugin settings** — an on/off switch, no commands.
+
+```bash
+git clone https://github.com/<you>/workbuddy-codex-bridge.git
+cd workbuddy-codex-bridge
+codex plugin marketplace add .
+codex plugin add wb-bridge@workbuddy-bridge
+```
+
+Now open the ChatGPT app → Settings → Plugins. `WorkBuddy Bridge` is listed with a toggle.
+
+| Toggle | What happens |
+| --- | --- |
+| **On** | Codex starts the plugin's helper process, which brings the gateway up and registers the `WB ·` models. |
+| **Off** | The gateway stops **and** your `config.toml` goes back to exactly how it was, so your official GPT models keep working. |
+
+Fully quit and reopen the app after switching, same as above — the model list is only read at startup.
+
+> [!NOTE]
+> Closing the app is not the same as switching the plugin off, and the two are handled differently on purpose. Closing it leaves the bridge running, because the app reads `config.toml` *before* it starts the plugin again — tearing down on every close would make the `WB ·` models vanish on alternate launches. Switching the plugin off does the full teardown.
+>
+> If you flip the switch while the app is closed, the gateway notices by itself within about 15 seconds and restores your config, so you do not have to reopen the app to finish the job. It only does this when the plugin started it; a gateway you launched by hand in a terminal is yours and is left alone. Progress goes to `~/.wb-bridge/plugin.log`.
+
+Ask the assistant *"is the WorkBuddy bridge running?"* and it can call the plugin's own tools to check, list the models, or roll everything back.
 
 ---
 
@@ -295,7 +324,7 @@ Everything below ran against a real CN subscription with real upstream calls, un
 <summary><b>Self-check</b></summary>
 
 ```bash
-npm test     # 36 checks — protocol, rewriting, headers, SSE, WS frames, proxy, config reversibility
+npm test     # 47 checks — protocol, rewriting, headers, SSE, WS frames, proxy, plugin lifecycle, config reversibility
 ```
 
 Half the suite is pure functions; the other half runs inject → re-inject (idempotent) → restore in a throwaway `CODEX_HOME` and asserts byte-level reversibility.
@@ -311,6 +340,8 @@ Half the suite is pure functions; the other half runs inject → re-inject (idem
 - **`model_catalog_json` is load-once and replaces the built-in catalogue.** The project clones native rows to compensate, but every change needs a full app restart.
 - **Upstream is streaming-only.** Non-streaming requests are rejected with `11101`; the bridge aggregates locally when a caller wants a buffered response.
 - **Protocol drift.** Upstream limits, headers and moderation change without notice.
+- **The plugin toggle is a process hook, not a real hook.** This Codex build reports `plugin_hooks` as `removed`, so the plugin's MCP server stands in for a lifecycle hook. It is spawned by Codex at session start and killed at session end; `codex exec` does **not** spawn it, so the toggle is meaningless for one-shot CLI runs — use `wb-bridge start` there.
+- **Toggle detection is poll-based.** When you switch the plugin off while the app is closed, the gateway notices by reading `config.toml` on a 15-second timer. Nothing breaks in the meantime — the gateway just serves a few more seconds than strictly needed.
 
 </details>
 

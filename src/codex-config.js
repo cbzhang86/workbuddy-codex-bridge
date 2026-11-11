@@ -190,7 +190,13 @@ export function restoreConfig() {
     fs.unlinkSync(backupPath());
   }
   fs.writeFileSync(p, content, "utf8");
-  try { fs.unlinkSync(catalogPath()); } catch { /* ignore */ }
+  // Only delete the catalog if nothing points at it any more. Deleting a file
+  // that the restored config still references makes Codex fail to load its
+  // config at all ("failed to load configuration") -- every model, including
+  // the official ones, stops working. Cheap to check, catastrophic to skip.
+  if (!content.includes(CATALOG_FILENAME)) {
+    try { fs.unlinkSync(catalogPath()); } catch { /* ignore */ }
+  }
   // Expire Codex's model cache so it re-reads on next launch.
   try {
     const cache = path.join(codexHome(), "models_cache.json");

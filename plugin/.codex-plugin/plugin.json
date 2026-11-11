@@ -1,0 +1,14 @@
+{
+  "name": "wb-bridge",
+  "version": "1.2.0",
+  "description": "Puts your WorkBuddy subscription models in the ChatGPT desktop app's model picker. Toggle it off in the plugin settings to go back to the official subscription.",
+  "author": "workbuddy-codex-bridge contributors",
+  "license": "MIT",
+  "displayName": "WorkBuddy Bridge",
+  "shortDescription": "WorkBuddy models in the model picker",
+  "category": "Models",
+  "capabilities": ["model-provider", "gateway-lifecycle"],
+  "websiteURL": "https://github.com/cbzhang86/workbuddy-codex-bridge",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json"
+}
