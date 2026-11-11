@@ -14,11 +14,12 @@ import { fileURLToPath } from "node:url";
 import os from "node:os";
 import { DEFAULT_PORT, DEFAULT_HOST, MODEL_PREFIX, OFFICIAL_CODEX_BASE } from "../src/constants.js";
 import { discoverCredential, ensureFreshCredential, oauthLogin, classifyUpstream } from "../src/credentials.js";
-import { requestThroughProxy } from "../src/proxy.js";
+import { requestThroughProxy, primeProbe } from "../src/proxy.js";
 import { fetchModels, fetchBusyLevels, busyLabel, prepareChatBody, chatStream } from "../src/upstream.js";
 import { streamResponses, bufferedResponses, forwardOfficial, sseEvents, sseWrite } from "../src/responses.js";
 import { attachWebSocketTransport } from "../src/websocket.js";
 import { writeCatalog, catalogPath, injectConfig, restoreConfig, injectionStatus } from "../src/codex-config.js";
+import { readCachedModels, writeCachedModels, modelsFingerprint } from "../src/cache.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
@@ -91,7 +92,7 @@ function watchPluginSwitch(config) {
       clearPid();
       process.exit(0);
     } catch { /* config unreadable -> keep serving */ }
-  }, 15000);
+  }, Number(config.pluginPollMs) || 5000);
   timer.unref();
 }
 
@@ -106,16 +107,26 @@ function isWorkBuddyModel(model) { return String(model || "").startsWith(`${MODE
 // setup: credential -> models -> catalog -> config.toml (idempotent)
 // ---------------------------------------------------------------------------
 let CACHED = null;
-async function ensureSetup(config, { quiet = false } = {}) {
-  const cred = await ensureFreshCredential(await discoverCredential(config), config);
-  let models = await fetchModels(cred, config, config.keepModelIds || []);
-  // Optionally append extra ids the operator knows are enabled on the account.
+
+// Publish a model list: append operator extras, write the catalog, inject the
+// config. Shared by the fast (cached) and the refreshed path so both land in
+// exactly the same shape.
+function publishModels(models, config, { withBusy = false } = {}) {
+  const list = models.map((m) => ({ ...m }));
   for (const id of config.extraModelIds || []) {
-    if (!models.some((m) => m.id === id)) {
-      models.push({ id, name: id, contextWindow: 200000, maxTokens: 32000, supportsImages: true, supportsToolCall: true });
+    if (!list.some((m) => m.id === id)) {
+      list.push({ id, name: id, contextWindow: 200000, maxTokens: 32000, supportsImages: true, supportsToolCall: true });
     }
   }
-  if (!models.length) throw new Error("model catalog is empty; check the credential / region");
+  if (!list.length) throw new Error("model catalog is empty; check the credential / region");
+  const cat = writeCatalog(list);
+  const inj = injectConfig({ port: config.port, catalogFile: cat.path });
+  return { models: list, cat, inj, withBusy };
+}
+
+async function ensureSetup(config, { quiet = false } = {}) {
+  const cred = await ensureFreshCredential(await discoverCredential(config), config);
+  const models = await fetchModels(cred, config, config.keepModelIds || []);
   // Queue state is a hint, never a hard requirement: an unreachable /busy
   // endpoint must not stop the bridge from coming up.
   if (config.showBusy !== false) {
@@ -125,8 +136,8 @@ async function ensureSetup(config, { quiet = false } = {}) {
       if (lvl) m.busyLevel = lvl;
     }
   }
-  const cat = writeCatalog(models);
-  const inj = injectConfig({ port: config.port, catalogFile: cat.path });
+  const { cat, inj } = publishModels(models, config);
+  writeCachedModels({ models, region: cred.domain || config.region, source: cred.source });
   CACHED = { cred, models, cat, inj };
   if (!quiet) {
     log(`\n  credential : ${cred.source}${cred.filePath ? ` (${cred.filePath})` : ""}  region=${cred.domain || config.region}`);
@@ -135,6 +146,51 @@ async function ensureSetup(config, { quiet = false } = {}) {
     log(`  config.toml: injected at line ${inj.insertAt} (${inj.configPath})`);
   }
   return CACHED;
+}
+
+// Publish the last known list so the gateway can listen immediately, then let
+// the caller refresh. Returns null when there is nothing credible to serve.
+function setupFromCache(config, { quiet = false } = {}) {
+  const cached = readCachedModels();
+  if (!cached) return null;
+  const { models, cat, inj } = publishModels(cached.models, config);
+  CACHED = { cred: null, models, cat, inj, fromCache: true, cacheAgeMs: cached.ageMs };
+  if (!quiet) {
+    const age = Math.round(cached.ageMs / 1000);
+    log(`\n  models     : ${models.length} WorkBuddy + ${cat.native} native  (cached ${age}s ago)`);
+    log(`  catalog    : ${cat.path}`);
+    log(`  config.toml: injected at line ${inj.insertAt} (${inj.configPath})`);
+  }
+  return CACHED;
+}
+
+// Fetch a fresh list and republish only when something the picker renders
+// actually changed. `ctx` is mutated in place, so handlers already holding it
+// see the new list without a restart.
+async function refreshModels(config, ctx, { quiet = false } = {}) {
+  const cred = await ensureFreshCredential(await discoverCredential(config), config);
+  const fetched = await fetchModels(cred, config, config.keepModelIds || []);
+  if (config.showBusy !== false) {
+    const levels = await fetchBusyLevels(cred, fetched.map((m) => m.id), config);
+    for (const m of fetched) {
+      const lvl = levels.get(m.id);
+      if (lvl) m.busyLevel = lvl;
+    }
+  }
+  const before = ctx.models ? modelsFingerprint(ctx.models) : "";
+  const next = publishModels(fetched, config);
+  writeCachedModels({ models: next.models, region: cred.domain || config.region, source: cred.source });
+  const changed = before !== modelsFingerprint(next.models);
+  // Keep the live context current. The catalog on disk is already rewritten; a
+  // changed list additionally needs Codex to re-read it, which only happens at
+  // app start -- so tell the user rather than pretending it is live.
+  ctx.cred = cred;
+  ctx.models = next.models;
+  ctx.cat = next.cat;
+  ctx.inj = next.inj;
+  ctx.fromCache = false;
+  if (!quiet && changed) log(`  models refreshed: ${next.models.length} WorkBuddy + ${next.cat.native} native`);
+  return { changed, models: next.models };
 }
 
 async function cmdModels(config) {
@@ -234,13 +290,29 @@ function authorized(req, config) {
   return h === `Bearer ${config.apiKey}` || h === config.apiKey;
 }
 
+// A start that served the cached list has no credential yet: resolving it is
+// what the background refresh is doing. Requests that arrive first must not
+// fail, so resolve it on demand and memoise the result on the context.
+let credInFlight = null;
+async function ensureCred(ctx, config) {
+  if (ctx.cred) return ctx.cred;
+  if (!credInFlight) {
+    credInFlight = ensureFreshCredential(await discoverCredential(config), config)
+      .then((cred) => { ctx.cred = cred; return cred; })
+      .finally(() => { credInFlight = null; });
+  }
+  return credInFlight;
+}
+
 // Plain OpenAI Chat Completions endpoint (also handy for other local tools).
 async function handleChatCompletions(req, res, raw, config, ctx) {
   let body;
   try { body = JSON.parse(raw.toString("utf8")); } catch { return sendJson(res, 400, { error: "invalid JSON" }); }
   const modelId = stripPrefix(body.model || ctx.models[0]?.id || "hy3");
   const upstreamBody = prepareChatBody(body, modelId);
-  const upstream = await chatStream(ctx.cred, upstreamBody, config);
+  let upstream;
+  try { upstream = await chatStream(await ensureCred(ctx, config), upstreamBody, config); }
+  catch (e) { return sendJson(res, 502, { error: { message: e.message, type: "credential" } }); }
   if (!upstream.ok) {
     const t = await upstream.text().catch(() => "");
     const kind = classifyUpstream(upstream.status, t);
@@ -306,8 +378,9 @@ async function handleResponses(req, res, raw, config, ctx, urlPath) {
     catch (e) { return sendJson(res, 502, { error: { message: `official forward failed: ${e.message}`, type: "upstream" } }); }
   }
   const modelId = stripPrefix(sentModel);
-  const common = { body, modelId, responseModel: sentModel, cred: ctx.cred, config };
+  const common = { body, modelId, responseModel: sentModel, cred: null, config };
   try {
+    common.cred = await ensureCred(ctx, config);
     if (body.stream === false) {
       const obj = await bufferedResponses(common);
       return sendJson(res, 200, obj);
@@ -360,7 +433,7 @@ async function handleWsCreate(msg, sink, config, ctx, reqHeaders) {
     body: msg,
     modelId: stripPrefix(sentModel),
     responseModel: sentModel,
-    cred: ctx.cred,
+    cred: await ensureCred(ctx, config),
     config,
   });
 }
@@ -415,8 +488,9 @@ function createServer(config, ctx) {
     if (req.method === "GET" && (urlPath === "/healthz" || urlPath === "/v1/healthz")) {
       return sendJson(res, 200, {
         ok: true, service: "workbuddy-codex-bridge",
-        region: ctx.cred.domain || config.region,
+        region: ctx.cred?.domain || config.region,
         models: ctx.models.length, nativePassthrough: OFFICIAL_CODEX_BASE,
+        cached: Boolean(ctx.fromCache),
       });
     }
     // OpenAI model list
@@ -467,8 +541,20 @@ function createServer(config, ctx) {
 }
 
 async function cmdStart(config) {
-  const ctx = await ensureSetup(config);
+  // Listen on the last known catalog before touching the network: Codex cannot
+  // reach a gateway that is not listening yet, and the two catalog round trips
+  // cost ~0.8s on a good day. The list is then revalidated in the background and
+  // republished only if the picker would actually look different.
+  let ctx = setupFromCache(config);
+  if (ctx) {
+    log("  (serving the cached list; revalidating in the background)");
+  } else {
+    ctx = await ensureSetup(config);
+  }
   const server = createServer(config, ctx);
+  // Reading the Windows proxy settings spawns `reg` (~110 ms cold). Do it now,
+  // off the request path, so the first forwarded native turn never pays for it.
+  primeProbe();
   server.listen(config.port, config.host, () => {
     recordInstall();
     recordPid();
@@ -478,6 +564,22 @@ async function cmdStart(config) {
     log(`  Native GPT       : forwarded to ${OFFICIAL_CODEX_BASE} (0-step rollback)`);
     log(`  Rollback         : wb-bridge restore`);
     log("\n  Fully QUIT and reopen the ChatGPT desktop app, then pick a \"WB · ...\" model in Codex mode.\n");
+    // Retry a few times: the first attempt races the network the user may have
+    // just enabled, and a stale list is far better than no list.
+    const revalidate = async () => {
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        try {
+          const { changed } = await refreshModels(config, ctx);
+          if (changed) log("  model list changed; QUIT and reopen the ChatGPT app to see it.");
+          return;
+        } catch (error) {
+          log(`  revalidation attempt ${attempt} failed: ${error.message}`);
+          await new Promise((r) => setTimeout(r, attempt * 2000));
+        }
+      }
+      if (ctx.fromCache) log("  still serving the cached list; run `wb-bridge models` to check upstream.");
+    };
+    revalidate();
   });
   // Codex prefers the Responses WebSocket transport and, when it is rejected,
   // retries five times (~16s of wall clock) before falling back to HTTPS. So

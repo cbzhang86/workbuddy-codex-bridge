@@ -10,7 +10,7 @@ import {
   DEVICE_ID_NAMESPACE, ROUTER_MODEL_IDS, UNAPPROVED_CHANNEL_OPENINGS, IDENTITY_CLAUSE,
   MODEL_BUSY_PATH,
 } from "./constants.js";
-import { chatBase, billingBase, originReferer, regionOf } from "./credentials.js";
+import { chatBase, originReferer, regionOf } from "./credentials.js";
 
 // ---------------------------------------------------------------------------
 // identity / headers
@@ -281,23 +281,38 @@ export async function fetchModels(cred, config = {}, keepIds = []) {
     "User-Agent": ua,
     ...(withOrigin ? { Origin: originReferer(cred.domain), Referer: `${originReferer(cred.domain)}/` } : {}),
   });
+  // A hung catalog request used to stall the whole startup: these calls gate the
+  // gateway being ready at all, so cap them well below a user's patience and
+  // retry once (the endpoint is the flakiest part of the flow).
+  const timeoutMs = Number(config.catalogTimeoutMs) || 8000;
   const getDoc = async (url, headers) => {
-    const r = await fetch(url, { headers, signal: AbortSignal.timeout(30000) });
-    const t = await r.text();
-    if (!r.ok) throw new Error(`catalog http ${r.status}: ${t.slice(0, 200)}`);
-    const env = JSON.parse(t);
-    return env.data || env;
+    let lastError;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch(url, { headers, signal: AbortSignal.timeout(timeoutMs) });
+        const t = await r.text();
+        if (!r.ok) throw new Error(`catalog http ${r.status}: ${t.slice(0, 200)}`);
+        const env = JSON.parse(t);
+        return env.data || env;
+      } catch (error) {
+        lastError = error;
+        if (attempt === 0) await new Promise((r) => setTimeout(r, 250));
+      }
+    }
+    throw lastError;
   };
+  // Both endpoints answer independently; racing them (rather than awaiting in
+  // turn) halves the startup wait because each is a full round trip.
+  const settle = (promise) => promise.then((data) => ({ data }), (error) => ({ error }));
 
   if (global) {
-    const docs = [];
-    for (const ua of [CATALOG_CLI_UA, APP_CHANNEL_UA]) {
-      try { docs.push(await getDoc(`${base}${GLOBAL_CONFIG_PATH}`, headersFor(ua, false))); }
-      catch { /* tolerate one channel failing */ }
-    }
+    const results = await Promise.all(
+      [CATALOG_CLI_UA, APP_CHANNEL_UA].map((ua) => settle(getDoc(`${base}${GLOBAL_CONFIG_PATH}`, headersFor(ua, false))))
+    );
+    const docs = results.filter((r) => r.data);
     if (docs.length === 0) throw new Error("global /v3/config unreachable in both channels");
     let models = [];
-    for (const d of docs) models = mergeRosters(models, selectCliModels(d, keepIds));
+    for (const d of docs) models = mergeRosters(models, selectCliModels(d.data, keepIds));
     return models;
   }
   // CN: two endpoints with different strengths.
@@ -306,15 +321,13 @@ export async function fetchModels(cred, config = {}, keepIds = []) {
   //   /v3/config                       -> wider roster, no pricing at all.
   // So: price/metadata comes from the enterprise catalog, and the roster is the
   // union of both, with enterprise rows winning on conflicts.
-  const docs = [];
-  try { docs.push({ kind: "catalog", data: await getDoc(`${base}${LEGACY_CATALOG_PATH}`, headersFor(CLIENT_UA, true)) }); }
-  catch { /* pricing unavailable: fall through to the roster-only endpoint */ }
-  try { docs.push({ kind: "config", data: await getDoc(`${base}${GLOBAL_CONFIG_PATH}`, headersFor(PRODUCT_UA, true)) }); }
-  catch { /* roster unavailable */ }
-  if (docs.length === 0) throw new Error("CN catalog unreachable on both endpoints");
-
-  const priced = docs.find((d) => d.kind === "catalog")?.data;
-  const rosterDoc = docs.find((d) => d.kind === "config")?.data;
+  const [pricedResult, rosterResult] = await Promise.all([
+    settle(getDoc(`${base}${LEGACY_CATALOG_PATH}`, headersFor(CLIENT_UA, true))),
+    settle(getDoc(`${base}${GLOBAL_CONFIG_PATH}`, headersFor(PRODUCT_UA, true))),
+  ]);
+  const priced = pricedResult.data;
+  const rosterDoc = rosterResult.data;
+  if (!priced && !rosterDoc) throw new Error("CN catalog unreachable on both endpoints");
   if (!priced) return selectCliModels(rosterDoc, keepIds);
 
   const primary = selectCliModels(priced, keepIds);
@@ -362,5 +375,3 @@ export async function chatStream(cred, bodyJson, config = {}, signal) {
   });
   return res;
 }
-
-export const billingBaseUrl = billingBase;

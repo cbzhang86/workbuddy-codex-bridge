@@ -1,7 +1,7 @@
 import http from "node:http";
 import https from "node:https";
 import tls from "node:tls";
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Proxy-aware transport for the official OpenAI endpoint.
@@ -80,11 +80,55 @@ function windowsRegistryProxy() {
   return server;
 }
 
+function windowsRegistryProxyExec() {
+  if (process.platform !== "win32") return Promise.resolve("");
+  const key = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+  // Async on purpose: `reg query` costs ~55 ms of synchronous child-process time
+  // per call, and doing that on the request path blocks every other connection
+  // the gateway is streaming.
+  const read = (name) => new Promise((resolve) => {
+    execFile("reg", ["query", key, "/v", name], { encoding: "utf8", timeout: 4000, windowsHide: true }, (error, stdout) => {
+      if (error) return resolve("");
+      const m = new RegExp(`${name}\\s+REG_\\w+\\s+(.+)`, "i").exec(String(stdout));
+      resolve(m ? m[1].trim() : "");
+    });
+  });
+  return (async () => {
+    // Both values come from one key: read them together, because each spawn
+    // costs tens of milliseconds of process setup.
+    const [enabledRaw, server] = await Promise.all([read("ProxyEnable"), read("ProxyServer")]);
+    // REG_DWORD renders as 0x1, not "1".
+    const enabled = String(enabledRaw).toLowerCase();
+    if (enabled !== "1" && enabled !== "0x1") return "";
+    if (!server) return "";
+    const parts = Object.fromEntries(
+      server.split(";").map((s) => s.split("=")).filter((p) => p.length === 2).map(([k, v]) => [k.trim().toLowerCase(), v.trim()])
+    );
+    if (parts.http || parts.https) return parts.https || parts.http || "";
+    return server;
+  })();
+}
+
+export async function detectProxyAsync(env = process.env) {
+  if (probed) return cached;
+  const fromEnv = normaliseProxy(envProxy(env));
+  const found = fromEnv || normaliseProxy(await windowsRegistryProxyExec());
+  probed = true;
+  cached = found;
+  return cached;
+}
+
 export function detectProxy(env = process.env) {
   if (probed) return cached;
   probed = true;
   cached = normaliseProxy(envProxy(env)) || normaliseProxy(windowsRegistryProxy());
   return cached;
+}
+
+// Pay the registry cost once, off the request path, so the first forwarded
+// native request never stumbles into a synchronous lookup.
+export function primeProbe() {
+  detectProxyAsync().catch(() => { /* best effort */ });
 }
 
 export function resetProxyCache() {
@@ -146,7 +190,7 @@ export async function requestThroughProxy(url, { method = "POST", headers = {}, 
   const isHttps = target.protocol === "https:";
   const port = Number(target.port) || (isHttps ? 443 : 80);
 
-  const px = detectProxy(env);
+  const px = await detectProxyAsync(env);
   const tunnel = px && !bypassProxy(target.hostname, env)
     ? await openTunnel({ proxy: px, host: target.hostname, port, timeoutMs })
     : null;

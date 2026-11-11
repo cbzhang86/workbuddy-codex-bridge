@@ -50,6 +50,7 @@ export const INJECT_BEGIN = "# >>> workbuddy-codex-bridge (undo: wb-bridge resto
 export const INJECT_END = "# <<< workbuddy-codex-bridge <<<";
 export const BACKUP_SUFFIX = ".wb-bridge-backup";
 export const CATALOG_FILENAME = "workbuddy-catalog.json";
+export const CATALOG_CACHE_FILENAME = "models-cache.json";
 
 export const SESSION_DEAD_MARKERS = ["Offline user session not found", "12153", "session expired"];
 export const CREDIT_MARKERS = [

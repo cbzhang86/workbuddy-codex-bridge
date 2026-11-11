@@ -5,6 +5,55 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-11-12
+
+Measured on the machine this was developed on (Windows, Node 25.8, real WorkBuddy
+account): cold start to `/healthz` went **2,775 ms → 2,495 ms**, warm start went
+**2,775 ms → ~870 ms**, and the injected catalogue went **1,088,322 B → 511,904 B**.
+A bare Node HTTP server on the same machine takes ~0.7 s, so warm start is now
+within ~0.2 s of the floor.
+
+### Added
+
+- **A model-list cache** (`src/cache.js`). The gateway now serves the last known
+  catalogue immediately and revalidates in the background, so a restart no longer
+  blocks on two upstream round trips. If the list actually changed the user is
+  told to reopen the app, because `model_catalog_json` is read once at launch;
+  queue-level churn is fingerprinted out and does not count as a change.
+- **`npm run test:live`** (`test/live.js`). The pure-function self test never
+  could have caught the bugs that actually cost days — zstd request bodies, the
+  WebSocket transport, an orphaned catalogue after `restore` — so this file
+  exercises a real gateway on port 10198 inside a throwaway `CODEX_HOME`.
+- **`primeProbe()`** on the Windows proxy probe, so the ~110 ms registry lookup
+  happens during boot instead of on the first forwarded native request.
+
+### Changed
+
+- **The catalogue only carries what routing needs.** Each routed row keeps
+  `approvals` and `permissions` from the native template and drops the rest of
+  `model_messages` (~35 KB per row of confirmation policies, guardian config and
+  token budgets that mean nothing to an upstream that never sees them). The
+  identity clause is replaced by the neutral instructions template.
+- **Catalogue and config writes are atomic** (temp file + rename). A half-written
+  `config.toml` makes Codex refuse to load its configuration at all, which takes
+  the official GPT models down with it; this had already happened once.
+- **`fetchModels` races its two endpoints** instead of awaiting them in turn, and
+  retries once with an 8 s timeout. Measured 1,396 ms → 767 ms.
+- **`detectProxy` got an async path** (`detectProxyAsync`) that reads
+  `ProxyEnable` and `ProxyServer` concurrently and never blocks the event loop;
+  the synchronous version stays for tests.
+- **The plugin toggle is checked every 5 s** instead of every 15 s.
+- **An identical catalogue is no longer rewritten** (saves ~30 ms and the disk
+  churn on every start).
+
+### Fixed
+
+- **`restore` was not idempotent.** A second call rewrote the config and claimed
+  a restore that had not happened; it now reports `{ restored: false, reason: "not injected" }`.
+- **`restore` could delete a catalogue the config still referenced**, leaving
+  Codex unable to load its config at all. The file is now only removed when
+  nothing points at it.
+
 ## [1.2.0] - 2026-11-12
 
 ### Added

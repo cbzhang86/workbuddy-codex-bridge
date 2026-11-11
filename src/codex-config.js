@@ -14,6 +14,25 @@ import { busyLabel } from "./upstream.js";
 export function codexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 }
+
+// Write beside the target, then rename. A half-written config.toml makes Codex
+// refuse to load its config at all ("failed to load configuration"), which takes
+// the official GPT models down with it -- so the file must never be observable
+// in a partial state, however the process dies mid-write.
+function writeAtomic(file, text) {
+  const tmp = `${file}.wb-tmp-${process.pid}`;
+  fs.writeFileSync(tmp, text, "utf8");
+  try {
+    fs.renameSync(tmp, file);
+  } catch (error) {
+    // Windows can refuse the rename while another process holds a handle on the
+    // target (a running Codex reading config.toml). Fall back to a direct write
+    // so the operation still lands, and never leave the .tmp behind.
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    if (process.platform !== "win32") throw error;
+    fs.writeFileSync(file, text, "utf8");
+  }
+}
 export function configPath() { return path.join(codexHome(), "config.toml"); }
 export function catalogPath() { return path.join(codexHome(), CATALOG_FILENAME); }
 export function backupPath() { return configPath() + BACKUP_SUFFIX; }
@@ -54,6 +73,35 @@ function neutralTemplate() {
   };
 }
 
+// The native template carries ~63 KB of `model_messages`, most of it rebuilt for
+// every routed row. Only a handful of those keys mean anything for a model that
+// is reached through a foreign provider:
+//   approvals / permissions -- how Codex gates local tool use, which still runs
+//     on the user's machine and must keep working
+// The rest (confirmation_policies 24 KB, guardian_v2, token_budget, multi_agent,
+// collaboration_modes, auto_review) describes OpenAI's own review/quotas and is
+// dead weight for a routed row. Keeping it cost ~604 KB of catalog and 4 ms of
+// cloning per build; dropping it takes the catalog to roughly a tenth.
+//
+// instructions_template / persistent_instructions are replaced, not copied: a
+// routed model must not inherit the GPT identity text, which the WorkBuddy
+// gateway rejects (error 11128).
+const ROUTED_MESSAGE_KEYS = ["approvals", "permissions"];
+const NEUTRAL_INSTRUCTIONS = "You are a helpful assistant.";
+
+function slimModelMessages(template) {
+  const source = template && typeof template === "object" ? template : {};
+  const out = {};
+  for (const key of ROUTED_MESSAGE_KEYS) {
+    if (Object.hasOwn(source, key)) out[key] = source[key];
+  }
+  // A template must exist: a routed row without one falls back to the heavy
+  // native default and re-introduces exactly the weight this drops.
+  out.instructions_template = NEUTRAL_INSTRUCTIONS;
+  out.persistent_instructions = "";
+  return out;
+}
+
 function neutralClone(template, model, index) {
   const slug = `${MODEL_PREFIX}/${model.id}`;
   const row = JSON.parse(JSON.stringify(template));
@@ -75,12 +123,9 @@ function neutralClone(template, model, index) {
   row.max_context_window = model.contextWindow || 200000;
   row.visibility = "list";
   row.supported_in_api = true;
-  // Routed models must not inherit GPT identity instructions, which the
-  // WorkBuddy gateway rejects (error 11128). Use a neutral system template.
-  if (row.model_messages) {
-    row.model_messages.instructions_template = "You are a helpful assistant.";
-    if (row.model_messages.persistent_instructions) row.model_messages.persistent_instructions = "";
-  }
+  // The template already carries the neutral identity (see buildCatalog), so
+  // only the per-model overrides are needed here.
+  row.model_messages = { ...row.model_messages };
   // code_mode_only mirrors what opencodex publishes for routed entries; keep
   // the native tool_mode when present so local exec/MCP tools stay available.
   if (row.tool_mode === "default") row.tool_mode = "default";
@@ -101,7 +146,10 @@ export function buildCatalog(models) {
   const native = loadNativeModels();
   const template = native ? native[0] : neutralTemplate();
   const rows = native ? native.map((r) => JSON.parse(JSON.stringify(r))) : [JSON.parse(JSON.stringify(template))];
-  const wbRows = models.map((m, i) => neutralClone(template, m, i));
+  // Clone the already-slimmed messages, not the 63 KB native blob, so each row
+  // copies a few hundred bytes instead of sixty kilobytes.
+  const slim = slimModelMessages(template);
+  const wbRows = models.map((m, i) => neutralClone({ ...template, model_messages: slim }, m, i));
   // Several ids share a product name on purpose: hy4free/hy4std are the free and
   // the credit-billed tier of Hy4; hy3/hy3-x likewise. They are distinct
   // offerings, NOT duplicates, so the name must stay. The price and promo are
@@ -122,7 +170,12 @@ export function writeCatalog(models) {
   const p = catalogPath();
   fs.mkdirSync(path.dirname(p), { recursive: true });
   const catalog = buildCatalog(models);
-  fs.writeFileSync(p, JSON.stringify(catalog, null, 2), "utf8");
+  const text = JSON.stringify(catalog, null, 2);
+  // Rewriting an identical 512 KB file costs ~30 ms and churns the disk on every
+  // start, which matters now that a cached list makes the rest of the boot fast.
+  let current = null;
+  try { current = fs.readFileSync(p, "utf8"); } catch { /* first run */ }
+  if (current !== text) writeAtomic(p, text);
   return { path: p, native: catalog.models.length - models.length, injected: models.length };
 }
 
@@ -158,7 +211,7 @@ export function injectConfig({ port, catalogFile, dryRun = false }) {
   // Save a pristine backup exactly once (so restore always returns to the
   // user's own config, never to a half-injected state).
   if (!fs.existsSync(backupPath())) {
-    fs.writeFileSync(backupPath(), cleaned, "utf8");
+    writeAtomic(backupPath(), cleaned);
   }
 
   const insertAt = findFirstTableLine(lines);
@@ -172,7 +225,7 @@ export function injectConfig({ port, catalogFile, dryRun = false }) {
     INJECT_END,
   ];
   const next = [...lines.slice(0, insertAt), ...block, ...lines.slice(insertAt)].join("\n");
-  if (!dryRun) fs.writeFileSync(p, next, "utf8");
+  if (!dryRun) writeAtomic(p, next);
   return { configPath: p, insertAt, wrote: !dryRun, preview: next.split("\n").slice(Math.max(0, insertAt - 2), insertAt + 6).join("\n") };
 }
 
@@ -184,12 +237,20 @@ export function restoreConfig() {
     return { restored: false, reason: "config.toml missing" };
   }
   const current = fs.readFileSync(p, "utf8");
+  const hadBlock = current.includes(INJECT_BEGIN);
+  const hadBackup = fs.existsSync(backupPath());
+  // Nothing of ours is in there: say so instead of rewriting the file and
+  // reporting a restore that did not happen.
+  if (!hadBlock && !hadBackup) {
+    try { fs.unlinkSync(catalogPath()); } catch { /* ignore */ }
+    return { restored: false, reason: "not injected", configPath: p };
+  }
   let content = stripInjected(current);
-  if (fs.existsSync(backupPath())) {
+  if (hadBackup) {
     content = fs.readFileSync(backupPath(), "utf8");
     fs.unlinkSync(backupPath());
   }
-  fs.writeFileSync(p, content, "utf8");
+  writeAtomic(p, content);
   // Only delete the catalog if nothing points at it any more. Deleting a file
   // that the restored config still references makes Codex fail to load its
   // config at all ("failed to load configuration") -- every model, including
@@ -203,7 +264,7 @@ export function restoreConfig() {
     if (fs.existsSync(cache)) {
       const j = JSON.parse(fs.readFileSync(cache, "utf8"));
       j.fetched_at = 0;
-      fs.writeFileSync(cache, JSON.stringify(j, null, 2), "utf8");
+      writeAtomic(cache, JSON.stringify(j, null, 2));
     }
   } catch { /* non-fatal */ }
   return { restored: true, configPath: p };

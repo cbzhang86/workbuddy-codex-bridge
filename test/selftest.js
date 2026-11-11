@@ -596,4 +596,60 @@ await tAsync("config: restore never deletes a catalog the config still points at
   }
 });
 
+// --- model cache (startup served before the first network trip) -------------
+await tAsync("cache: round-trips a list and reports its age", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wb-cache-"));
+  const prev = process.env.WB_BRIDGE_STATE;
+  process.env.WB_BRIDGE_STATE = tmp;
+  try {
+    const CM = await import(`${href("src/cache.js")}?cache`);
+    assert.equal(CM.readCachedModels(), null, "an absent cache reads as null");
+    CM.writeCachedModels({ models: [{ id: "hy3", name: "Hy3" }], region: "cn", source: "vault" });
+    const back = CM.readCachedModels();
+    assert.equal(back.models.length, 1);
+    assert.equal(back.models[0].id, "hy3");
+    assert.equal(back.region, "cn");
+    assert.equal(back.stale, false, "a fresh write is not stale");
+    assert.ok(back.ageMs >= 0 && back.ageMs < 5000);
+  } finally {
+    if (prev === undefined) delete process.env.WB_BRIDGE_STATE;
+    else process.env.WB_BRIDGE_STATE = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+await tAsync("cache: rejects a corrupt or empty entry rather than serving it", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "wb-cache2-"));
+  const prev = process.env.WB_BRIDGE_STATE;
+  process.env.WB_BRIDGE_STATE = tmp;
+  try {
+    const CM = await import(`${href("src/cache.js")}?cache2`);
+    fs.writeFileSync(CM.cachePath(), "{ not json", "utf8");
+    assert.equal(CM.readCachedModels(), null, "unparseable cache is ignored");
+    fs.writeFileSync(CM.cachePath(), JSON.stringify({ savedAt: Date.now(), region: "cn", models: [] }), "utf8");
+    assert.equal(CM.readCachedModels(), null, "an empty list is not a usable catalog");
+    fs.writeFileSync(CM.cachePath(), JSON.stringify({ savedAt: Date.now(), region: "cn", models: [{ id: 5 }] }), "utf8");
+    assert.equal(CM.readCachedModels(), null, "entries without a string id are rejected");
+  } finally {
+    if (prev === undefined) delete process.env.WB_BRIDGE_STATE;
+    else process.env.WB_BRIDGE_STATE = prev;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+await tAsync("cache: fingerprint ignores queue churn but catches real changes", async () => {
+  const CM = await import(`${href("src/cache.js")}?cache3`);
+  const base = [
+    { id: "hy3", name: "Hy3", contextWindow: 192000, creditMultiplier: 0, badges: ["x"], busyLevel: "idle" },
+    { id: "glm-5.3", name: "GLM-5.3", contextWindow: 1000000, creditMultiplier: 0.69, badges: [], busyLevel: "busy" },
+  ];
+  const fp = CM.modelsFingerprint(base);
+  assert.equal(CM.modelsFingerprint(base.map((m) => ({ ...m, busyLevel: "idle" }))), fp,
+    "a flapping queue level must not republish the catalog");
+  assert.notEqual(CM.modelsFingerprint(base.map((m) => ({ ...m, creditMultiplier: 0.5 }))), fp,
+    "a price change must republish");
+  assert.notEqual(CM.modelsFingerprint(base.slice(1)), fp, "a dropped model must republish");
+  assert.equal(CM.modelsFingerprint([base[1], base[0]]), fp, "order alone is not a change");
+});
+
 console.log(`\n${passed} checks passed.`);

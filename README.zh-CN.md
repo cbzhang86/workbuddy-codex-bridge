@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](#给开发者)
-[![Tests](https://img.shields.io/badge/tests-47%20passing-success.svg)](#自检)
+[![Tests](https://img.shields.io/badge/tests-50%20passing-success.svg)](#自检)
 [![Rollback](https://img.shields.io/badge/回退-0%20步%20%7C%201%20条命令-blue.svg)](#怎么回退)
 [![Status](https://img.shields.io/badge/status-实验性-orange.svg)](#常见问题)
 
@@ -87,7 +87,7 @@ codex plugin add wb-bridge@workbuddy-bridge
 > [!NOTE]
 > 「关掉 App」和「关掉插件开关」不是一回事，这两种情况是**故意**分开处理的。只关 App 的话，网关会继续跑着，因为 App 是**先**读 `config.toml`、**再**启动插件的 —— 每次退出都拆掉的话，`WB ·` 模型会隔次消失。只有关掉插件开关才会完整回退。
 >
-> 如果你在 App 关着的时候翻转开关，网关会自己在大约 15 秒内发现，然后把配置还原，不用再开一次 App。这个自我了断只在网关由插件启动时生效；你在终端里手动起的网关归你管，它不会碰。过程写到 `~/.wb-bridge/plugin.log`。
+> 如果你在 App 关着的时候翻转开关，网关会自己在大约 5 秒内发现，然后把配置还原，不用再开一次 App。这个自我了断只在网关由插件启动时生效；你在终端里手动起的网关归你管，它不会碰。过程写到 `~/.wb-bridge/plugin.log`。
 
 装好之后可以直接问助手「WorkBuddy 网关还在跑吗」，它能调用插件自带的工具去查状态、列模型，或者一键还原。
 
@@ -324,10 +324,35 @@ openai_base_url = "http://127.0.0.1:10100/v1"
 <summary><b>自检</b></summary>
 
 ```bash
-npm test     # 47 项 —— 协议、改写、请求头、SSE、WS 帧、代理、插件生命周期、配置可逆性
+npm test            # 50 项 —— 协议、改写、请求头、SSE、WS 帧、代理、插件生命周期、配置可逆性
+npm run test:live   # 7 项 —— 起一个真实网关（端口 10198）在临时 CODEX_HOME 里跑
 ```
 
 一半是纯函数；另一半在临时 `CODEX_HOME` 里跑「注入 → 重复注入（幂等）→ 还原」，并断言字节级可逆。
+
+`test:live` 单列，因为真正耗掉几天的 bug——zstd 请求体、WebSocket 传输、
+`restore` 之后成了孤儿文件的目录——全都只在真实进程上才暴露。它需要真实的
+WorkBuddy 凭据，没有就自动跳过。
+
+</details>
+
+<details>
+<summary><b>性能</b></summary>
+
+在开发机上实测（Windows、Node 25.8、真实 WorkBuddy 账号），数字是多次冷启动的中位数，不是合成基准。
+
+| 路径 | 优化前 | 优化后 | 说明 |
+| --- | --- | --- | --- |
+| 冷启动（无缓存） | 2,775 ms | 2,495 ms | 两个上游接口改为并发 |
+| 热启动（有缓存） | 2,775 ms | **约 870 ms** | 裸 Node HTTP 服务本身约 700 ms |
+| 注入的目录文件 | 1,088,322 B | **511,904 B** | 路由行只留路由真正用到的字段 |
+| `fetchModels` | 1,396 ms | 767 ms | `Promise.all` 取代顺序 await |
+| Windows 代理探测 | 111–182 ms | 冷 115 ms，热 0.01 ms | 异步并发，启动时预热 |
+| 热路径 | — | 0.283 ms/请求 | 翻译 + 请求体准备，49 个条目 / 53 KB |
+
+热路径从来不是瓶颈：首字延迟由上游决定（小提示词 1.0–1.3 秒），本地怎么优化都改不了。真正值得修的是「一轮对话连第一个字节都还发不出去」之前发生的事。
+
+启动时先拿缓存清单，再在后台校验。这是有意的权衡：后台刷新的几百毫秒里清单可能是旧的；如果清单真的变了，会提示你重开 App，而不是假装已经实时生效。
 
 </details>
 
@@ -341,7 +366,8 @@ npm test     # 47 项 —— 协议、改写、请求头、SSE、WS 帧、代理
 - **上游只支持流式。** 非流式请求会被拒（`11101`），需要缓冲时网关本地聚合。
 - **协议会漂移。** 上游限流、头要求、内容审核随时可能变。
 - **插件开关是「假钩子」。** 这个版本 Codex 把 `plugin_hooks` 标成 `removed`，所以插件自带的 MCP 服务器顶替了生命周期钩子：Codex 开会话时拉起它、结束会话时杀掉它。但 `codex exec` **不会**拉起插件，所以一次性 CLI 场景下这个开关没意义，请用 `wb-bridge start`。
-- **关开关是靠轮询发现的。** 如果 App 关着的时候把插件关掉，网关靠每 15 秒读一次 `config.toml` 才发现。这期间不会出错，只是网关会多活几秒。
+- **关开关是靠轮询发现的。** 如果 App 关着的时候把插件关掉，网关靠每 5 秒读一次 `config.toml` 才发现。这期间不会出错，只是网关会多活几秒。
+- **启动时先拿缓存清单。** 第一次启动要等上游目录接口，约 1.6–2.5 秒；之后启动 0.6–0.9 秒就监听（这台机器上裸 Node HTTP 服务本身就要 0.7 秒），同时在后台校验。清单真的变了会提示你重启 App，因为 `model_catalog_json` 只在 App 启动时读一次。
 
 </details>
 

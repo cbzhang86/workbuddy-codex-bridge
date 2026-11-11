@@ -7,7 +7,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](#for-developers)
-[![Tests](https://img.shields.io/badge/tests-47%20passing-success.svg)](#self-check)
+[![Tests](https://img.shields.io/badge/tests-50%20passing-success.svg)](#self-check)
 [![Rollback](https://img.shields.io/badge/rollback-0%20steps%20%7C%201%20command-blue.svg)](#going-back)
 [![Status](https://img.shields.io/badge/status-experimental-orange.svg)](#troubleshooting)
 
@@ -324,10 +324,42 @@ Everything below ran against a real CN subscription with real upstream calls, un
 <summary><b>Self-check</b></summary>
 
 ```bash
-npm test     # 47 checks — protocol, rewriting, headers, SSE, WS frames, proxy, plugin lifecycle, config reversibility
+npm test        # 50 checks — protocol, rewriting, headers, SSE, WS frames, proxy, plugin lifecycle, config reversibility
+npm run test:live   # 7 checks against a real gateway on port 10198, in a throwaway CODEX_HOME
 ```
 
 Half the suite is pure functions; the other half runs inject → re-inject (idempotent) → restore in a throwaway `CODEX_HOME` and asserts byte-level reversibility.
+
+`test:live` is separate because the bugs that actually cost days — zstd request
+bodies, the WebSocket transport, an orphaned catalogue after `restore` — only ever
+showed up against a live process. It needs a real WorkBuddy credential and skips
+itself when there is none.
+
+</details>
+
+<details>
+<summary><b>Performance</b></summary>
+
+Measured on the development machine (Windows, Node 25.8, real WorkBuddy account).
+Numbers are medians of repeated cold runs, not synthetic benchmarks.
+
+| Path | Before | After | Note |
+| --- | --- | --- | --- |
+| Cold start (no cache) | 2,775 ms | 2,495 ms | two upstream endpoints, now raced |
+| Warm start (cache) | 2,775 ms | **~870 ms** | bare Node HTTP server takes ~700 ms |
+| Injected catalogue | 1,088,322 B | **511,904 B** | routed rows keep only what routing uses |
+| `fetchModels` | 1,396 ms | 767 ms | `Promise.all` instead of sequential awaits |
+| Windows proxy probe | 111–182 ms | 115 ms cold, 0.01 ms warm | async, concurrent, primed at boot |
+| Hot request path | — | 0.283 ms/request | translation + body prep, 49 items / 53 KB |
+
+The hot path was never the bottleneck: TTFB is dominated by the upstream (1.0–1.3 s
+on a small prompt), which no amount of local optimisation changes. What was worth
+fixing was everything that happened *before* the first byte of a turn was possible.
+
+Startup now serves a cached list and revalidates in the background. That is a
+deliberate trade: the list can be stale for the few hundred milliseconds of a
+background refresh, and if it changed you are told to reopen the app rather than
+being lied to about a live update.
 
 </details>
 
@@ -341,7 +373,8 @@ Half the suite is pure functions; the other half runs inject → re-inject (idem
 - **Upstream is streaming-only.** Non-streaming requests are rejected with `11101`; the bridge aggregates locally when a caller wants a buffered response.
 - **Protocol drift.** Upstream limits, headers and moderation change without notice.
 - **The plugin toggle is a process hook, not a real hook.** This Codex build reports `plugin_hooks` as `removed`, so the plugin's MCP server stands in for a lifecycle hook. It is spawned by Codex at session start and killed at session end; `codex exec` does **not** spawn it, so the toggle is meaningless for one-shot CLI runs — use `wb-bridge start` there.
-- **Toggle detection is poll-based.** When you switch the plugin off while the app is closed, the gateway notices by reading `config.toml` on a 15-second timer. Nothing breaks in the meantime — the gateway just serves a few more seconds than strictly needed.
+- **Toggle detection is poll-based.** When you switch the plugin off while the app is closed, the gateway notices by reading `config.toml` on a 5-second timer. Nothing breaks in the meantime — the gateway just serves a few more seconds than strictly needed.
+- **Startup serves a cached model list first.** The very first run pays ~1.6–2.5 s of catalogue round trips; later runs listen in ~0.6–0.9 s (a bare Node HTTP server costs ~0.7 s on the machine this was measured on) and revalidate in the background. When the list did change you are told to restart the app, because `model_catalog_json` is only read at launch.
 
 </details>
 

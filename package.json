@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-codex-bridge",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Inject locally signed-in WorkBuddy (CN/Global) subscription models into the official ChatGPT desktop app's Codex model picker, with a one-command rollback to the official subscription.",
   "type": "module",
   "engines": {
@@ -28,7 +28,8 @@
     "login": "node bin/wb-bridge.js login",
     "models": "node bin/wb-bridge.js models",
     "status": "node bin/wb-bridge.js status",
-    "test": "node test/selftest.js"
+    "test": "node test/selftest.js",
+    "test:live": "node test/live.js"
   },
   "keywords": [
     "workbuddy",
