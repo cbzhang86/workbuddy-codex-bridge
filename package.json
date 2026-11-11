@@ -1,0 +1,53 @@
+{
+  "name": "workbuddy-codex-bridge",
+  "version": "1.0.0",
+  "description": "Inject locally signed-in WorkBuddy (CN/Global) subscription models into the official ChatGPT desktop app's Codex model picker, with a one-command rollback to the official subscription.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "wb-bridge": "bin/wb-bridge.js"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "test/",
+    "config.example.json",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "start": "node bin/wb-bridge.js start",
+    "setup": "node bin/wb-bridge.js setup",
+    "restore": "node bin/wb-bridge.js restore",
+    "login": "node bin/wb-bridge.js login",
+    "models": "node bin/wb-bridge.js models",
+    "status": "node bin/wb-bridge.js status",
+    "test": "node test/selftest.js"
+  },
+  "keywords": [
+    "workbuddy",
+    "codebuddy",
+    "codex",
+    "chatgpt",
+    "responses-api",
+    "chat-completions",
+    "model-picker",
+    "proxy",
+    "gateway",
+    "llm"
+  ],
+  "license": "MIT",
+  "author": "workbuddy-codex-bridge contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cbzhang86/workbuddy-codex-bridge.git"
+  },
+  "homepage": "https://github.com/cbzhang86/workbuddy-codex-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/cbzhang86/workbuddy-codex-bridge/issues"
+  }
+}

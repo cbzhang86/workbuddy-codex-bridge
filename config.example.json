@@ -1,0 +1,14 @@
+{
+  "region": "cn",
+  "host": "127.0.0.1",
+  "port": 10100,
+  "credentialFile": "",
+  "cnBase": "",
+  "apiKey": "",
+  "deviceToken": "",
+  "deviceFile": "",
+  "timeoutMs": 120000,
+  "emitReasoning": true,
+  "keepModelIds": [],
+  "extraModelIds": []
+}

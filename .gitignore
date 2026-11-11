@@ -1,0 +1,33 @@
+# Local configuration and credentials — never commit these
+config.json
+config.local.json
+*.local.json
+
+# Credential vaults and dumps
+auths/
+data/
+workbuddy-vault/
+.workbuddy-auth*.json
+workbuddy-desktop*.info
+*.credentials.json
+
+# Logs and captured traffic
+*.log
+logs/
+*.sse
+*.ndjson
+.wb-live.out
+
+# Generated model catalogues (machine-specific absolute paths)
+workbuddy-catalog.json
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Node
+node_modules/
+npm-debug.log*
