@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.join(__dirname, "..");
 const href = (rel) => pathToFileURL(path.join(ROOT, rel)).href;
+const B = await import(href("bin/wb-bridge.js"));
 const C = await import(href("src/constants.js"));
 const U = await import(href("src/upstream.js"));
 const R = await import(href("src/responses.js"));
@@ -291,6 +292,173 @@ t("codex-config: inject/strip/restore is fully reversible in a temp home", async
     if (prev === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = prev;
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+// --- readBody content-encoding handling -------------------------------------
+// Regression: the Codex client sends request bodies zstd-compressed once they
+// grow past a few kilobytes. Before this was handled, those requests reached
+// the handlers as opaque bytes and died as a bare "invalid JSON".
+await tAsync("readBody: decodes identity/gzip/deflate/br/zstd bodies", async () => {
+  const zlib = await import("node:zlib");
+  const { Duplex } = await import("node:stream");
+  const { readBody } = B;
+  const fakeReq = (buf, headers = {}) => {
+    const r = new Duplex({ read() { this.push(buf); this.push(null); }, write(_c, _e, cb) { cb(); } });
+    r.headers = headers;
+    return r;
+  };
+  const payload = Buffer.from(JSON.stringify({ model: "wb/hy3", input: "hi" }));
+  const cases = [
+    ["identity", payload, {}],
+    ["gzip", zlib.gzipSync(payload), { "content-encoding": "gzip" }],
+    ["deflate", zlib.deflateSync(payload), { "content-encoding": "deflate" }],
+    ["br", zlib.brotliCompressSync(payload), { "content-encoding": "br" }],
+    ["zstd", zlib.zstdCompressSync(payload), { "content-encoding": "zstd" }],
+  ];
+  for (const [enc, buf, headers] of cases) {
+    const got = await readBody(fakeReq(buf, headers));
+    assert.equal(got.toString("utf8"), payload.toString("utf8"), enc);
+  }
+});
+
+await tAsync("readBody: rejects unknown encoding (415) and corrupt body (400)", async () => {
+  const zlib = await import("node:zlib");
+  const { Duplex } = await import("node:stream");
+  const { readBody } = B;
+  const fakeReq = (buf, headers = {}) => {
+    const r = new Duplex({ read() { this.push(buf); this.push(null); }, write(_c, _e, cb) { cb(); } });
+    r.headers = headers;
+    return r;
+  };
+  await assert.rejects(() => readBody(fakeReq(Buffer.from("x"), { "content-encoding": "exotic" })), (e) => e.status === 415);
+  await assert.rejects(() => readBody(fakeReq(Buffer.from("not gzip"), { "content-encoding": "gzip" })), (e) => e.status === 400);
+});
+
+// --- catalog metadata (credits / promo badges / queue state) ----------------
+t("parseCreditMultiplier: reads the leading number of the credits string", () => {
+  assert.equal(U.parseCreditMultiplier("x0.29 credits"), 0.29);
+  assert.equal(U.parseCreditMultiplier("x0.00 credits"), 0);
+  assert.equal(U.parseCreditMultiplier("x0.11"), 0.11);
+  assert.equal(U.parseCreditMultiplier("x2.20 credits"), 2.2);
+  assert.equal(U.parseCreditMultiplier("x1.00"), 1);
+  assert.equal(U.parseCreditMultiplier("free"), undefined);
+  assert.equal(U.parseCreditMultiplier(undefined), undefined);
+  assert.equal(U.parseCreditMultiplier(0.5), 0.5);
+});
+
+t("parseBadges: extracts promo labels and drops the colour", () => {
+  assert.deepEqual(U.parseBadges(["craft", "badge:限时免费:#FF0000"]), ["限时免费"]);
+  assert.deepEqual(U.parseBadges(["badge:夜间折扣:#1E90FF", "badge:限时免费:#FF0000"]), ["夜间折扣", "限时免费"]);
+  // A label containing a colon must survive: split on the LAST colon only.
+  assert.deepEqual(U.parseBadges(["badge:限时:半价:#FF0000"]), ["限时:半价"]);
+  assert.deepEqual(U.parseBadges(["craft", "text-to-image"]), []);
+  assert.deepEqual(U.parseBadges(undefined), []);
+});
+
+t("busyLabel: maps upstream levels to the picker wording", () => {
+  assert.equal(U.busyLabel("idle"), "空闲");
+  assert.equal(U.busyLabel("normal"), "正常");
+  assert.equal(U.busyLabel("busy"), "繁忙");
+  assert.equal(U.busyLabel(undefined), "未知");
+  assert.equal(U.busyLabel("something-new"), "未知");
+});
+
+t("buildCatalog: display_name carries cost + promo, and collisions are qualified", async () => {
+  const CR = await import(href("src/codex-config.js"));
+  const models = [
+    { id: "hy3", name: "Hy3", contextWindow: 192000, creditMultiplier: 0, badges: ["限时免费"] },
+    { id: "hy3-x", name: "Hy3", contextWindow: 192000, creditMultiplier: 0.05 },
+    { id: "glm-5.2", name: "GLM-5.2", contextWindow: 1000000, creditMultiplier: 0.79, badges: ["夜间折扣"], busyLevel: "idle" },
+  ];
+  const cat = CR.buildCatalog(models);
+  const rows = new Map(cat.models.filter((r) => r.slug.startsWith("wb/")).map((r) => [r.slug, r]));
+  // hy3 and hy3-x are the free tier and the billed tier of the same product.
+  // The product name is the honest label; the price keeps them apart.
+  assert.equal(rows.get("wb/hy3").display_name, "WB · Hy3 · x0.00 · 限时免费");
+  assert.equal(rows.get("wb/hy3-x").display_name, "WB · Hy3 · x0.05");
+  assert.notEqual(rows.get("wb/hy3").display_name, rows.get("wb/hy3-x").display_name);
+  assert.equal(rows.get("wb/hy3").slug, "wb/hy3");
+  assert.equal(rows.get("wb/hy3-x").slug, "wb/hy3-x");
+  assert.equal(rows.get("wb/glm-5.2").display_name, "WB · GLM-5.2 · x0.79 · 夜间折扣");
+  assert.match(rows.get("wb/glm-5.2").description, /queue: 空闲/);
+  assert.match(rows.get("wb/glm-5.2").description, /cost x0\.79 credits/);
+  // A model with no price must not render a dangling separator.
+  const bare = CR.buildCatalog([{ id: "m", name: "M", contextWindow: 1000 }]);
+  const bareRow = bare.models.find((r) => r.slug === "wb/m");
+  assert.equal(bareRow.display_name, "WB · M");
+});
+
+
+// --- WebSocket transport ---------------------------------------------------
+const WS = await import(href("src/websocket.js"));
+{
+  const { acceptKey, encodeFrame, decodeFrames, frameSink } = WS.__test;
+  t("ws acceptKey: matches the RFC 6455 example", () => {
+    // RFC 6455 section 1.3: this key maps to this accept value.
+    assert.equal(acceptKey("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+  });
+  t("ws encodeFrame: single-byte, 16-bit and 64-bit length branches", () => {
+    const small = encodeFrame("hi");
+    assert.equal(small[0], 0x81);
+    assert.equal(small[1], 2);
+    const mid = encodeFrame("x".repeat(200));
+    assert.equal(mid[1], 126);
+    assert.equal(mid.readUInt16BE(2), 200);
+    const big = encodeFrame("x".repeat(70000));
+    assert.equal(big[1], 127);
+    assert.equal(Number(big.readBigUInt64BE(2)), 70000);
+  });
+  t("ws decodeFrames: unmasks a client frame and keeps the remainder", () => {
+    const payload = Buffer.from('{"type":"response.create"}');
+    const mask = Buffer.from([1, 2, 3, 4]);
+    const masked = Buffer.from(payload);
+    for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i % 4];
+    const frame = Buffer.concat([
+      Buffer.from([0x81, 0x80 | payload.length]), mask, masked,
+      Buffer.from([0x81]), // a partial frame: must stay in "rest"
+    ]);
+    const { frames, rest } = decodeFrames(frame);
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0].payload.toString("utf8"), '{"type":"response.create"}');
+    assert.equal(rest.length, 1);
+  });
+  t("ws frameSink: turns SSE into text frames and drops [DONE]", () => {
+    const written = [];
+    const socket = { destroyed: false, write: (b) => { written.push(b); return true; } };
+    const sink = frameSink(socket, null);
+    sink.write('event: response.created\ndata: {"type":"response.created"}\n\n');
+    sink.write("data: [DONE]\n\n");
+    sink.end();
+    const text = Buffer.concat(written).toString("utf8");
+    assert.ok(text.includes('{"type":"response.created"}'));
+    assert.ok(!text.includes("[DONE]"), "the WS transport must not emit the SSE terminator");
+  });
+}
+
+// --- proxy-aware transport -------------------------------------------------
+const PX = await import(href("src/proxy.js"));
+t("proxy: reads flat, scheme-prefixed and per-scheme values", () => {
+  PX.resetProxyCache();
+  assert.deepEqual(PX.detectProxy({ HTTPS_PROXY: "127.0.0.1:7890" }), { protocol: "http:", host: "127.0.0.1", port: 7890 });
+  PX.resetProxyCache();
+  assert.deepEqual(PX.detectProxy({ HTTP_PROXY: "http://10.0.0.5:8080" }), { protocol: "http:", host: "10.0.0.5", port: 8080 });
+  PX.resetProxyCache();
+  // A PAC script URL is not a proxy: it must never be used as one. An invalid
+  // env value falls through to the OS setting, which is acceptable.
+  const pac = PX.detectProxy({ HTTPS_PROXY: "http://proxy.local:5/pac.js" });
+  assert.ok(!pac || pac.host !== "proxy.local", "a PAC path is not a proxy");
+  // No env proxy: whatever the OS reports (the Windows registry here) is fine,
+  // so only assert the shape when a proxy is detected at all.
+  PX.resetProxyCache();
+  const osProxy = PX.detectProxy({});
+  if (osProxy) assert.equal(typeof osProxy.port, "number");
+});
+t("proxy: bypasses NO_PROXY hosts", () => {
+  const env = { NO_PROXY: "localhost,.internal,*.corp" };
+  assert.equal(PX.bypassProxy("localhost", env), true);
+  assert.equal(PX.bypassProxy("api.internal", env), true);
+  assert.equal(PX.bypassProxy("a.corp", env), true);
+  assert.equal(PX.bypassProxy("chatgpt.com", env), false);
 });
 
 console.log(`\n${passed} checks passed.`);

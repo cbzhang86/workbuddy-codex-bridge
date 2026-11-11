@@ -179,11 +179,54 @@ export function prepareChatBody(source, modelId) {
 // ---------------------------------------------------------------------------
 // model catalog discovery
 // ---------------------------------------------------------------------------
+// The catalog expresses the price as a string ("x0.29 credits", "x0.11"), and
+// dsh-connect-workbuddy parses it with the same regex. Only the leading number
+// after the "x" is meaningful; the trailing word differs per endpoint.
+export function parseCreditMultiplier(value) {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "string") return undefined;
+  const m = /x\s*([0-9]*\.?[0-9]+)/iu.exec(value);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+// Promo badges ride along as `badge:<label>:<#RRGGBB>` inside `tags`. The label
+// itself may contain ":" so split on the LAST colon and keep everything before.
+export function parseBadges(tags) {
+  if (!Array.isArray(tags)) return [];
+  const out = [];
+  for (const t of tags) {
+    if (typeof t !== "string" || !t.startsWith("badge:")) continue;
+    const rest = t.slice("badge:".length);
+    const cut = rest.lastIndexOf(":");
+    const label = (cut > 0 ? rest.slice(0, cut) : rest).trim();
+    if (label && !out.includes(label)) out.push(label);
+  }
+  return out;
+}
+
+// `contextWindow` is either a number or {defaultLength, supportedLengths[]}.
+function contextWindowOf(v) {
+  const cw = v.contextWindow;
+  if (typeof cw === "number" && cw > 0) return cw;
+  if (cw && typeof cw === "object") {
+    const n = Number(cw.defaultLength);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
+const BUSY_LABELS = { idle: "空闲", normal: "正常", busy: "繁忙", queuing: "排队中", unknown: "未知" };
+export function busyLabel(level) {
+  return BUSY_LABELS[String(level || "").toLowerCase()] || "未知";
+}
+
 function parseUpstreamModel(v) {
   if (!v || typeof v !== "object") return null;
   const id = String(v.id || v.modelId || v.name || "");
   if (!id || v.disabled === true) return null;
-  const ctx = Number(v.maxInputTokens ?? v.contextWindow ?? 200000) || 200000;
+  const ctx = Number(v.maxInputTokens) || contextWindowOf(v) || 200000;
   const maxOut = Number(v.maxOutputTokens ?? v.maxTokens ?? 32000) || 32000;
   return {
     id,
@@ -193,7 +236,9 @@ function parseUpstreamModel(v) {
     supportsImages: v.disabledMultimodal !== true,
     supportsToolCall: v.supportsToolCall !== false,
     reasoning: v.reasoning || undefined,
-    creditMultiplier: v.creditMultiplier ?? v.credit ?? undefined,
+    creditMultiplier: parseCreditMultiplier(v.credits ?? v.creditMultiplier ?? v.credit),
+    badges: parseBadges(v.tags),
+    vendor: v.vendor || undefined,
   };
 }
 function selectCliModels(data, keepIds = []) {
@@ -255,14 +300,40 @@ export async function fetchModels(cred, config = {}, keepIds = []) {
     for (const d of docs) models = mergeRosters(models, selectCliModels(d, keepIds));
     return models;
   }
-  // CN: PRODUCT_UA app channel is richest; fall back to legacy CLI catalog.
-  try {
-    const d = await getDoc(`${base}${GLOBAL_CONFIG_PATH}`, headersFor(PRODUCT_UA, true));
-    return selectCliModels(d, keepIds);
-  } catch {
-    const d = await getDoc(`${base}${LEGACY_CATALOG_PATH}`, headersFor(CLIENT_UA, true));
-    return selectCliModels(d, keepIds);
+  // CN: two endpoints with different strengths.
+  //   /v2/enterprises/personal/models  -> authoritative `credits` + `tags` (badges)
+  //                                       but its `cli` roster omits some ids.
+  //   /v3/config                       -> wider roster, no pricing at all.
+  // So: price/metadata comes from the enterprise catalog, and the roster is the
+  // union of both, with enterprise rows winning on conflicts.
+  const docs = [];
+  try { docs.push({ kind: "catalog", data: await getDoc(`${base}${LEGACY_CATALOG_PATH}`, headersFor(CLIENT_UA, true)) }); }
+  catch { /* pricing unavailable: fall through to the roster-only endpoint */ }
+  try { docs.push({ kind: "config", data: await getDoc(`${base}${GLOBAL_CONFIG_PATH}`, headersFor(PRODUCT_UA, true)) }); }
+  catch { /* roster unavailable */ }
+  if (docs.length === 0) throw new Error("CN catalog unreachable on both endpoints");
+
+  const priced = docs.find((d) => d.kind === "catalog")?.data;
+  const rosterDoc = docs.find((d) => d.kind === "config")?.data;
+  if (!priced) return selectCliModels(rosterDoc, keepIds);
+
+  const primary = selectCliModels(priced, keepIds);
+  if (!rosterDoc) return primary;
+  return mergeRosters(primary, selectCliModels(rosterDoc, keepIds));
+}
+
+// Busy/queue state per model. Returns a Map<id, busy_level>; an unavailable
+// endpoint is not an error (the picker just shows no queue hint).
+export async function fetchBusyLevels(cred, modelIds, config = {}) {
+  const out = new Map();
+  const raw = await fetchBusy(cred, modelIds, config);
+  const list = Array.isArray(raw?.data) ? raw.data : Array.isArray(raw) ? raw : [];
+  for (const row of list) {
+    const id = row?.model || row?.id;
+    const lvl = row?.busy_level ?? row?.busyLevel;
+    if (id && lvl) out.set(String(id), String(lvl));
   }
+  return out;
 }
 
 export async function fetchBusy(cred, modelIds, config = {}) {

@@ -9,11 +9,14 @@
 import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_PORT, DEFAULT_HOST, MODEL_PREFIX, OFFICIAL_CODEX_BASE } from "../src/constants.js";
 import { discoverCredential, ensureFreshCredential, oauthLogin, classifyUpstream } from "../src/credentials.js";
-import { fetchModels, prepareChatBody, chatStream } from "../src/upstream.js";
-import { streamResponses, bufferedResponses, forwardOfficial, sseEvents } from "../src/responses.js";
+import { requestThroughProxy } from "../src/proxy.js";
+import { fetchModels, fetchBusyLevels, busyLabel, prepareChatBody, chatStream } from "../src/upstream.js";
+import { streamResponses, bufferedResponses, forwardOfficial, sseEvents, sseWrite } from "../src/responses.js";
+import { attachWebSocketTransport } from "../src/websocket.js";
 import { writeCatalog, catalogPath, injectConfig, restoreConfig, injectionStatus } from "../src/codex-config.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -59,6 +62,15 @@ async function ensureSetup(config, { quiet = false } = {}) {
     }
   }
   if (!models.length) throw new Error("model catalog is empty; check the credential / region");
+  // Queue state is a hint, never a hard requirement: an unreachable /busy
+  // endpoint must not stop the bridge from coming up.
+  if (config.showBusy !== false) {
+    const levels = await fetchBusyLevels(cred, models.map((m) => m.id), config);
+    for (const m of models) {
+      const lvl = levels.get(m.id);
+      if (lvl) m.busyLevel = lvl;
+    }
+  }
   const cat = writeCatalog(models);
   const inj = injectConfig({ port: config.port, catalogFile: cat.path });
   CACHED = { cred, models, cat, inj };
@@ -74,11 +86,15 @@ async function ensureSetup(config, { quiet = false } = {}) {
 async function cmdModels(config) {
   const cred = await ensureFreshCredential(await discoverCredential(config), config);
   const models = await fetchModels(cred, config, config.keepModelIds || []);
+  const levels = config.showBusy === false ? new Map() : await fetchBusyLevels(cred, models.map((m) => m.id), config);
   log(`WorkBuddy models (region=${cred.domain || config.region}, source=${cred.source}):\n`);
-  log("  " + "ID".padEnd(30) + "NAME".padEnd(26) + "CTX".padEnd(10) + "MAXOUT");
+  log("  " + "ID".padEnd(26) + "NAME".padEnd(24) + "COST".padEnd(8) + "QUEUE".padEnd(8) + "CTX".padEnd(10) + "PROMO");
   for (const m of models) {
-    log("  " + String(m.id).padEnd(30) + String(m.name).slice(0, 25).padEnd(26) +
-      String(m.contextWindow).padEnd(10) + String(m.maxTokens));
+    const cost = typeof m.creditMultiplier === "number" ? `x${m.creditMultiplier.toFixed(2)}` : "-";
+    const queue = busyLabel(levels.get(m.id));
+    const promo = (m.badges || []).join(",") || "-";
+    log("  " + String(m.id).padEnd(26) + String(m.name).slice(0, 23).padEnd(24) +
+      cost.padEnd(8) + queue.padEnd(8) + String(m.contextWindow).padEnd(10) + promo);
   }
   log(`\n  ${models.length} models. They appear in the Codex picker as "${MODEL_PREFIX}/<id>" after restart.`);
 }
@@ -139,7 +155,22 @@ function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks)));
+    req.on("end", () => {
+      let raw = Buffer.concat(chunks);
+      // The Codex client compresses large request bodies. Without this the body
+      // is opaque bytes and every parse fails with a bare "invalid JSON".
+      const enc = String(req.headers["content-encoding"] || "").toLowerCase().trim();
+      try {
+        if (enc === "gzip" || enc === "x-gzip") raw = zlib.gunzipSync(raw);
+        else if (enc === "deflate") raw = zlib.inflateSync(raw);
+        else if (enc === "br") raw = zlib.brotliDecompressSync(raw);
+        else if (enc === "zstd" || enc === "zstandard") raw = zlib.zstdDecompressSync(raw);
+        else if (enc) return reject(Object.assign(new Error(`unsupported content-encoding: ${enc}`), { status: 415 }));
+      } catch (e) {
+        return reject(Object.assign(new Error(`failed to decode ${enc} body: ${e.message}`), { status: 400 }));
+      }
+      resolve(raw);
+    });
     req.on("error", reject);
   });
 }
@@ -251,6 +282,78 @@ async function handleResponses(req, res, raw, config, ctx, urlPath) {
   }
 }
 
+// One WebSocket `response.create` frame: identical pipeline to POST
+// /v1/responses, writing into a sink that re-frames SSE as WS text frames.
+async function handleWsCreate(msg, sink, config, ctx, reqHeaders) {
+  const sentModel = String(msg.model || "");
+  if (!isWorkBuddyModel(sentModel)) {
+    // Native GPT also arrives here (the injected config redirects the built-in
+    // `openai` provider to this loopback). Forward it to the official backend
+    // with the client's own auth headers and re-frame the SSE reply.
+    return await forwardOfficialToSink(msg, sink, { headers: reqHeaders || {} });
+  }
+  // `prewarm` frames are empty (input: [], generate: false); there is nothing to
+  // run, but the client still expects an accepted, subsequently closed stream.
+  if (msg.generate === false || (Array.isArray(msg.input) && msg.input.length === 0)) {
+    sseWrite(sink, "response.created", { response: emptyResponse(msg.model) });
+    sseWrite(sink, "response.in_progress", { response: emptyResponse(msg.model) });
+    sseWrite(sink, "response.completed", { response: { ...emptyResponse(msg.model), status: "completed" } });
+    sink.end();
+    return;
+  }
+  await streamResponses({
+    res: sink,
+    body: msg,
+    modelId: stripPrefix(sentModel),
+    responseModel: sentModel,
+    cred: ctx.cred,
+    config,
+  });
+}
+
+// Forward a native (non-WorkBuddy) turn to the official Codex backend and pipe
+// the returned SSE straight into the sink. The client's auth headers arrive in
+// the upgrade request, which is the only place Codex puts its ChatGPT token.
+async function forwardOfficialToSink(msg, sink, { headers }) {
+  const { pickForwardHeaders } = await import("../src/responses.js");
+  const upstream = await requestThroughProxy(`${OFFICIAL_CODEX_BASE}/responses`, {
+    method: "POST",
+    headers: pickForwardHeaders({ headers }),
+    body: JSON.stringify({ ...msg, stream: true }),
+    timeoutMs: 300000,
+  });
+  if (upstream.status >= 400) {
+    const text = await readAll(upstream.stream);
+    throw Object.assign(new Error(`official forward failed: ${text.slice(0, 400)}`), {
+      code: "official_forward_failed", status: upstream.status,
+    });
+  }
+  await new Promise((resolve, reject) => {
+    upstream.stream.on("data", (chunk) => { sink.write(chunk.toString("utf8")); });
+    upstream.stream.once("end", resolve);
+    upstream.stream.once("error", reject);
+  });
+  if (!sink.writableEnded) sink.end();
+}
+
+function readAll(stream) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    stream.on("data", (c) => chunks.push(c));
+    stream.once("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    stream.once("error", reject);
+  });
+}
+
+function emptyResponse(model) {
+  return {
+    id: `resp_${Date.now()}`, object: "response",
+    created_at: Math.floor(Date.now() / 1000),
+    status: "in_progress", model: model || "",
+    output: [], error: null, incomplete_details: null, usage: null,
+  };
+}
+
 function createServer(config, ctx) {
   return http.createServer(async (req, res) => {
     const urlPath = (req.url || "/").split("?")[0];
@@ -280,7 +383,20 @@ function createServer(config, ctx) {
     if (!authorized(req, config)) return sendJson(res, 401, { error: "unauthorized" });
     if (req.method !== "POST") return sendJson(res, 405, { error: "method not allowed" });
 
-    const raw = await readBody(req);
+    let raw;
+    try { raw = await readBody(req); }
+    catch (e) { log(`  ! body read failed (${req.headers["content-encoding"] || "identity"}): ${e.message}`); return sendJson(res, e.status || 400, { error: { message: e.message, type: "request_body" } }); }
+    if (process.env.WB_BRIDGE_DEBUG) log(`  -> ${req.method} ${urlPath} ${raw.length}B enc=${req.headers["content-encoding"] || "identity"} head=${JSON.stringify(raw.subarray(0, 1).toString("hex"))}`);
+    // WB_BRIDGE_DUMP=<file> writes every request body and the translated
+    // messages, so protocol rejections can be diagnosed from the real payload
+    // instead of guessed at. Off unless the variable is set.
+    if (process.env.WB_BRIDGE_DUMP) {
+      try {
+        fs.appendFileSync(process.env.WB_BRIDGE_DUMP,
+          `\n===== ${new Date().toISOString()} ${req.method} ${urlPath} =====\n` +
+          `RAW:\n${raw.toString("utf8")}\n`);
+      } catch { /* dump is best-effort */ }
+    }
     if (urlPath === "/v1/responses" || urlPath === "/responses" ||
         urlPath === "/v1/responses/compact" || urlPath === "/responses/compact") {
       return handleResponses(req, res, raw, config, ctx, urlPath);
@@ -306,14 +422,13 @@ async function cmdStart(config) {
     log(`  Rollback         : wb-bridge restore`);
     log("\n  Fully QUIT and reopen the ChatGPT desktop app, then pick a \"WB · ...\" model in Codex mode.\n");
   });
-  // Codex CLI probes the Responses WebSocket transport first. We only speak HTTP,
-  // so answer the upgrade handshake with an explicit 405 immediately: that makes
-  // Codex fall back to HTTPS on the first try instead of retrying 5 times (~5s).
-  server.on("upgrade", (req, socket) => {
-    const path = (req.url || "/").split("?")[0];
-    log(`  ws upgrade declined (HTTP-only bridge): ${path}`);
-    socket.write("HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
-    socket.destroy();
+  // Codex prefers the Responses WebSocket transport and, when it is rejected,
+  // retries five times (~16s of wall clock) before falling back to HTTPS. So
+  // speak it: each `response.create` frame runs exactly the same pipeline as a
+  // POST /v1/responses and the SSE events are re-framed as WS text frames.
+  attachWebSocketTransport(server, {
+    log,
+    handleCreate: (msg, sink, _signal, headers) => handleWsCreate(msg, sink, config, ctx, headers),
   });
   const stop = () => { server.close(() => process.exit(0)); };
   process.on("SIGINT", stop); process.on("SIGTERM", stop);
@@ -364,4 +479,8 @@ Options:
 After start, FULLY QUIT (not just close) the ChatGPT desktop app and reopen it.`;
 }
 
-main();
+// Only start the CLI when executed directly, so tests can import readBody.
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) main();
+
+export { readBody, createServer };

@@ -8,6 +8,7 @@
 import crypto from "node:crypto";
 import { OFFICIAL_CODEX_BASE } from "./constants.js";
 import { prepareChatBody, chatStream } from "./upstream.js";
+import { requestThroughProxy } from "./proxy.js";
 
 const uid = () => crypto.randomUUID().replaceAll("-", "");
 const msgId = () => `msg_${uid()}`;
@@ -65,6 +66,32 @@ export function translateResponsesToChat(body, modelId) {
     ? [{ type: "message", role: "user", content: input }]
     : Array.isArray(input) ? input : [];
 
+  // The subscription backend enforces strict tool-call pairing: every
+  // assistant tool_call needs a tool result right after it, and a tool result
+  // without a preceding call is rejected outright with error 11148 ("tool calls
+  // and tool results do not match"). Verified against the live gateway: a
+  // dangling call, an orphan result and a well-formed pair are the only three
+  // shapes that matter, and the first two always fail.
+  //
+  // Codex legitimately produces both shapes — a turn can end on a call the
+  // harness never executed, and queued output can outlive its call. Rather than
+  // refuse the whole conversation we drop the unpaired half: an unanswered call
+  // carries no information the model can act on, and a result whose call is gone
+  // has no meaning on its own.
+  const declaredCalls = new Set();
+  const answeredCalls = new Set();
+  const historyCalls = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+    const callId = item.call_id || item.id;
+    if (!callId) continue;
+    if (item.type === "function_call" || item.type === "custom_tool_call") {
+      declaredCalls.add(callId);
+      historyCalls.push({ call_id: callId, name: item.name || "" });
+    } else if (item.type === "function_call_output" || item.type === "custom_tool_call_output") answeredCalls.add(callId);
+  }
+  const isPaired = (callId) => declaredCalls.has(callId) && answeredCalls.has(callId);
+
   let pendingCalls = [];
   const flushCalls = () => { pushAssistantToolCalls(out.messages, pendingCalls); pendingCalls = []; };
   for (const item of items) {
@@ -80,6 +107,7 @@ export function translateResponsesToChat(body, modelId) {
       }
       case "function_call":
       case "custom_tool_call": {
+        if (!isPaired(item.call_id || item.id)) break; // unanswered call: drop
         pendingCalls.push({
           call_id: item.call_id || item.id || `call_${uid()}`,
           name: item.name || "",
@@ -89,6 +117,7 @@ export function translateResponsesToChat(body, modelId) {
       }
       case "function_call_output":
       case "custom_tool_call_output": {
+        if (!isPaired(item.call_id)) break; // orphan result: no call to answer
         flushCalls();
         out.messages.push({
           role: "tool",
@@ -111,19 +140,59 @@ export function translateResponsesToChat(body, modelId) {
   flushCalls();
 
   // tools
-  if (Array.isArray(body.tools) && body.tools.length) {
-    const tools = body.tools
-      .filter((t) => t && (t.type === "function" || (!t.type && t.name)))
-      .map((t) => ({
-        type: "function",
-        function: {
-          name: t.name || "",
-          description: t.description || "",
-          parameters: t.parameters || { type: "object", properties: {} },
-        },
-      }));
-    if (tools.length) out.tools = tools;
+  //
+  // Codex does not send a top-level `tools` array: it announces its toolset as
+  // `input` items of type `additional_tools`, grouped into `namespace` objects
+  // (functions / clock / collaboration …). Ignoring those items leaves the model
+  // with no tools at all, and — because the history then contains tool_calls
+  // whose declarations vanished — the upstream rejects the turn with 11148.
+  // Collect from both places and flatten the namespaces.
+  const collected = [];
+  const seenNames = new Set();
+  const addTool = (name, description, parameters) => {
+    const n = String(name || "").trim();
+    if (!n || seenNames.has(n)) return;
+    seenNames.add(n);
+    collected.push({
+      type: "function",
+      function: {
+        name: n,
+        description: String(description || ""),
+        parameters: parameters && typeof parameters === "object" ? parameters : { type: "object", properties: {} },
+      },
+    });
+  };
+  const walkTools = (list) => {
+    if (!Array.isArray(list)) return;
+    for (const t of list) {
+      if (!t || typeof t !== "object") continue;
+      if (t.type === "namespace") { walkTools(t.tools); continue; }
+      if (t.type === "function") { addTool(t.name, t.description, t.parameters); continue; }
+      // `custom` tools (e.g. Codex's `exec`) take free-form source text rather
+      // than JSON. Chat Completions can only express JSON-schema arguments, so
+      // it is exposed as a single-string function; the model then sends the
+      // payload in `input`, which is what the custom tool expects anyway.
+      if (t.type === "custom") {
+        addTool(t.name, t.description, {
+          type: "object",
+          properties: { input: { type: "string", description: "Raw tool input." } },
+          required: ["input"],
+        });
+      }
+    }
+  };
+  for (const item of items) {
+    if (item && item.type === "additional_tools") walkTools(item.tools);
   }
+  walkTools(body.tools);
+  // A paired call in the history must have a matching declaration or the
+  // upstream reports the transcript as inconsistent.
+  for (const call of historyCalls) {
+    if (!seenNames.has(call.name)) {
+      addTool(call.name, "", { type: "object", properties: {} });
+    }
+  }
+  if (collected.length) out.tools = collected;
   // tool_choice: Responses uses {type:"function", name}; Chat uses a string.
   if (typeof body.tool_choice === "string") out.tool_choice = body.tool_choice;
   else if (body.tool_choice?.type === "function") {
@@ -515,22 +584,19 @@ export function pickForwardHeaders(req) {
 export async function forwardOfficial(req, res, pathSuffix, rawBody) {
   const url = `${OFFICIAL_CODEX_BASE}${pathSuffix}`;
   const headers = pickForwardHeaders(req);
-  const upstream = await fetch(url, {
-    method: "POST", headers, body: rawBody,
-    signal: AbortSignal.timeout(300000),
+  const upstream = await requestThroughProxy(url, {
+    method: "POST", headers, body: rawBody, timeoutMs: 300000,
   });
   res.statusCode = upstream.status;
   for (const [k, v] of upstream.headers) {
     if (["transfer-encoding", "connection", "content-length"].includes(k.toLowerCase())) continue;
     res.setHeader(k, v);
   }
-  if (!upstream.body) { res.end(); return; }
-  const reader = upstream.body.getReader();
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
-    }
-  } finally { res.end(); }
+  const body = upstream.stream;
+  await new Promise((resolve, reject) => {
+    body.on("data", (chunk) => { res.write(chunk); });
+    body.once("end", resolve);
+    body.once("error", reject);
+  });
+  res.end();
 }

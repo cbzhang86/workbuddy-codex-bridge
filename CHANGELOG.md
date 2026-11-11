@@ -5,6 +5,45 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-11
+
+### Added
+
+- **Responses WebSocket transport.** The gateway now completes the RFC 6455
+  handshake on `ws://127.0.0.1:<port>/v1/responses`, decodes each
+  `response.create` frame, runs the same pipeline as the HTTP route, and re-frames
+  the SSE events as text frames. Codex used to spend ~16 s per turn retrying this
+  probe before falling back to HTTPS; it now succeeds on the first attempt.
+  `sec-websocket-extensions` is deliberately not negotiated, so frames stay
+  uncompressed.
+- **Proxy-aware forwarding.** Node's built-in `fetch` ignores the Windows
+  "Internet Settings" proxy and reads `NODE_USE_ENV_PROXY` only at process start,
+  so forwarded native-model turns failed with `502 fetch failed` behind a local
+  proxy. The gateway now detects the proxy itself (env vars, then the registry),
+  honours `NO_PROXY`, and tunnels with `CONNECT`.
+- **Picker metadata.** Every WorkBuddy model now carries its credit multiplier and
+  promo badge in `display_name` (e.g. `WB · Hy3 · x0.00 · 限时免费`) plus context,
+  cost, promo and live queue state in `description`, matching the
+  `dsh-connect-workbuddy` presentation. Costs come from
+  `GET /v2/enterprises/personal/models`; queue state from `POST /v2/chat/busy`.
+
+### Fixed
+
+- **`11148 tool calls and tool results do not match`.** Two causes. Codex sends
+  its tool declarations inside an `additional_tools` input item rather than the
+  top-level `tools` field, and that item was dropped — leaving history with
+  `tool_calls` but no declarations. Independently, upstream rejects any assistant
+  tool call without a matching result, and any result without a matching call.
+  Declarations are now collected from `additional_tools` (flattening `namespace`
+  trees, exposing `custom` tools as a single-string `input` schema) and
+  unmatched halves are dropped.
+- **Free vs. paid tiers were being renamed.** `hy4free`/`hy4std` and `hy3`/`hy3-x`
+  are two price tiers of the same product, not duplicates. Collision handling now
+  keys on the full display name, so the tiers stay distinguishable by cost badge
+  while keeping their own slugs.
+
+---
+
 ## [1.0.0] - 2026-11-11
 
 Initial release.
@@ -56,11 +95,10 @@ Initial release.
 
 - Only the Codex mode picker can surface injected models; the regular Chat and Work
   surfaces have no public injection path.
-- Some desktop builds apply a second remote allowlist that drops locally catalogued
+- Desktop builds may apply a second remote allowlist that drops locally catalogued
   models (openai/codex#19694, #29156); the CLI and TUI are unaffected.
-- Codex probes the Responses WebSocket transport first and retries five times before
-  falling back to HTTPS — cosmetic noise plus a few seconds per request. The
-  `responses_websockets` feature flags are marked `removed` upstream, so it cannot
-  be disabled.
+- The upstream protocol drifts: rate limits, header requirements and moderation
+  change without notice, so the adapter may need updating.
 
+[1.1.0]: https://github.com/<owner>/workbuddy-codex-bridge/releases/tag/v1.1.0
 [1.0.0]: https://github.com/<owner>/workbuddy-codex-bridge/releases/tag/v1.0.0

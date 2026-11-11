@@ -1,308 +1,352 @@
+<div align="center">
+
 # workbuddy-codex-bridge
 
-把**国内版 WorkBuddy 桌面端订阅**里的内置模型，直接注入到**官方 ChatGPT 桌面 App 的 Codex 模式模型选择器**里点选使用；想回到官方订阅时，**点回原生 GPT 是 0 步，彻底回退是 1 条命令**。
+**在官方 ChatGPT 桌面端里直接选 WorkBuddy 的模型，想回官方订阅随时能回。**
 
-零第三方依赖（只用 Node.js 内置模块，Node ≥ 22）、单进程、跨平台（Windows / macOS / Linux），不需要安装或运行 opencodex。
-
-> [!WARNING]
-> **非官方集成，违反上游服务条款。** 腾讯云明确「订阅限定为交互式编程工具使用，禁止通用 API 自动化、自定义应用后端和非交互式批量调用」，把订阅经第三方代理喂给 ChatGPT 正是该模式 —— **账号或套餐可能被限流、限制或停用**。动手前请先读[合规与风险](#合规与风险)。
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)](https://nodejs.org/)
+[![Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](#给开发者)
+[![Tests](https://img.shields.io/badge/tests-36%20passing-success.svg)](#自检)
+[![Rollback](https://img.shields.io/badge/回退-0%20步%20%7C%201%20条命令-blue.svg)](#怎么回退)
+[![Status](https://img.shields.io/badge/status-实验性-orange.svg)](#常见问题)
 
 [English](README.md) · [简体中文](README.zh-CN.md)
 
----
-
-## 目录
-
-- [要解决的问题](#要解决的问题)
-- [它做了什么](#它做了什么)
-- [链路](#链路)
-- [前置条件](#前置条件)
-- [快速开始](#快速开始)
-- [命令](#命令)
-- [配置](#配置)
-- [工作原理](#工作原理)
-- [回退到官方订阅](#回退到官方订阅)
-- [实测记录](#实测记录)
-- [已知限制](#已知限制)
-- [安全](#安全)
-- [合规与风险](#合规与风险)
-- [参与贡献](#参与贡献)
-- [许可证](#许可证)
-- [致谢](#致谢)
+</div>
 
 ---
 
-## 要解决的问题
-
-WorkBuddy 桌面客户端订阅解锁了一整套模型 —— Hy4、GLM-5.3、Kimi-K3、DeepSeek-V4、MiniMax-M3.1 等等。你可以在 WorkBuddy 里跟它们对话，却无法在 ChatGPT 桌面 App 里选中它们，因为：
-
-1. **Codex 只说 OpenAI Responses API。** WorkBuddy 后端说 Chat Completions，还带一整套专有身份头，两者在协议层不兼容。
-2. **桌面登录态是加密的。** WorkBuddy 5.6 起本地凭据文件被 AES-256-GCM 封存，只有 App 能解。
-3. **没有一等 provider。** 像 [opencodex](https://opencodex.me/) 这样的社区网关只为*国际版*订阅暴露 `workbuddy-ai`；国内版没有对应 OAuth provider，而 opencodex 的 `headers` 字段明确拒绝 `Authorization` / cookie / API-key 头，无法注入 WorkBuddy 身份头。
-
-常见绕法是手改 `~/.codex/config.toml` 指向第三方代理 —— 能用，但**回到**官方订阅要手动还原文件、撤销目录覆盖、再重启，两三步且容易出错。
-
-本项目同时补上这两个缺口：模型出现在选择器里，回退只要 **0 次点击**（重新选原生 GPT）或 **1 条命令**。
+> [!WARNING]
+> **非官方工具，会违反上游规则。**
+>
+> 你的 WorkBuddy 订阅授权范围是**交互式编程工具**。腾讯明确禁止自动化、自定义后端、批量调用 —— 而本项目恰好就是这个模式。**账号或套餐可能被限流、限制甚至停用。** 接受不了就别用，改用[官方 TokenHub API](https://cloud.tencent.com/document/product/1823/133532)：那是官方支持、有文档的方式，同样能让 Codex 用上这些模型，且没这个风险。
 
 ---
 
-## 它做了什么
+## 你能得到什么
 
-吸收了两个现成项目的能力，但把它们合成一个自包含的网关：
+你付费买了 WorkBuddy，它解锁了约 16 个模型 —— GLM-5.3、Kimi-K3.1、DeepSeek-V4.1、MiniMax-M3.1 等等。问题是：你只能在 **WorkBuddy 那个 App 里**用它们。
 
-| 来源 | 吸收了什么 |
+本项目把这些模型全部塞进 **官方 ChatGPT 桌面端的模型下拉框**，和 GPT 排在一起。选中就用，工具调用、流式输出、思考过程都正常。
+
+还有一个多数工具都做不好的点 —— **回去很简单**：
+
+| 你想干什么 | 你要做什么 |
 | --- | --- |
-| [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) | **订阅线协议**：读取/刷新客户端登录凭据、构造 WorkBuddy 全套请求头、会话身份三连、请求体改写、渠道指纹脱敏、`/v3/config` 动态模型目录、`/v2/chat/completions` 流式上游、错误码分类。 |
-| [opencodex](https://opencodex.me/) | **loopback 注入策略**：保留内置 `openai` provider，只注入两个根级键（`openai_base_url` + `model_catalog_json`），并写出共享模型目录；完全可逆，不碰 `~/.codex/auth.json`。 |
+| 换回官方 GPT 模型用一下 | **什么都不用做**，下拉框里选它就行 |
+| 彻底不要这个项目了 | **一条命令**：`wb-bridge restore`，然后重开 App |
 
-直接装 opencodex 在这里行不通：它在 Windows 上禁用本地插件自动加载（`"On Windows automatic plugin loading is disabled until an ACL trust check is available."`），`headers` 字段拒绝凭据头，且国内版订阅没有一等 provider。直接说 Responses API 就完全省掉了额外进程。
-
----
-
-## 链路
-
-```
-ChatGPT 桌面 App · Codex 模式
-  │  POST /v1/responses   (模型 = wb/glm-5.2)
-  ▼
-~/.codex/config.toml  openai_base_url = http://127.0.0.1:10100/v1
-  ▼
-workbuddy-codex-bridge (本机 127.0.0.1:10100，单进程)
-  │  Responses → Chat Completions 翻译 + 注入 OAuth token / 全套头 / 正文改写
-  ▼
-https://copilot.tencent.com/v2/chat/completions   → 你的订阅额度
-```
-
-**0 步回退**：在选择器里点回任意原生 GPT —— 网关把非 `wb/` 前缀的请求原样转发到 `https://chatgpt.com/backend-api/codex`（转发传入的 `Authorization`），官方订阅照常工作，无需停服务。
-
-本机实测：从 CN 订阅 `/v3/config` 动态发现 **16 个内置模型**（hy4free / hy4std / hy3 / hy3-x / deepseek-v4.1-flash / glm-5.3 / glm-5.3-flash / glm-5.2 / space-bunny / minimax-m3.1-flash / kimi-k3.1-pro / kimi-k3-1 / kimi-k2.8-preview / deepseek-v4-pro / step-5-preview / mimo-v2.6-pro），上下文 192k–1M，全部以 `WB · <名字>` 出现在选择器里。
+不用卸载，不用手改配置文件，不用惦记「那行我改回去了吗」。
 
 ---
 
-## 前置条件
+## 三步开始
 
-- **Node.js ≥ 22**（用到原生 `fetch` / `AbortSignal.timeout` / `node:crypto`）。本机验证环境 v25.8.1。
-- 已安装并**登录** WorkBuddy 桌面客户端（国内版），或可用浏览器完成设备 OAuth。
-- 已安装带 **Codex 模式**的新版 ChatGPT 桌面 App（macOS / Windows）。
-- 用户级 `~/.codex/config.toml` 存在（Codex 至少启动过一次）。`~/.codex/auth.json` 绝不改动。
-
-无 npm 依赖，无构建步骤。
-
----
-
-## 快速开始
+**需要准备**：Node.js 22 以上、装了 Codex 模式的 ChatGPT 桌面端。**WorkBuddy 不需要开着。**
 
 ```bash
 git clone https://github.com/<you>/workbuddy-codex-bridge.git
 cd workbuddy-codex-bridge
-
-cp config.example.json config.json     # 可选：按需改端口/区域/凭据
-node bin/wb-bridge.js start            # 发现模型 → 写目录 → 注入 → 起服务
+node bin/wb-bridge.js start
 ```
 
-输出示例：
-
-```
-  credential : vault (.../.dsh/workbuddy-vault/cn/c4957....json)  region=www.workbuddy.cn
-  models     : 16 WorkBuddy + 1 native
-  catalog    : .../.codex/workbuddy-catalog.json
-  config.toml: injected at line 2
-
-  workbuddy-codex-bridge listening on http://127.0.0.1:10100/v1
-  Native GPT       : forwarded to https://chatgpt.com/backend-api/codex (0-step rollback)
-  Rollback         : wb-bridge restore
-```
+这一条命令会自己找到你的订阅、读取模型列表、注册好、然后在 `127.0.0.1:10100` 起一个本地网关。让它一直跑着。
 
 > [!IMPORTANT]
-> **必须完全退出 ChatGPT 桌面 App —— 不是关窗口。** 用托盘/菜单栏的 Quit，或 `Cmd+Q` / 右键退出。`model_catalog_json` 只在启动时读取。
+> **现在把 ChatGPT 完全退出 —— 只关窗口不算。**
+>
+> 用托盘 / 菜单栏的「退出」，或者在任务管理器里结束所有 `ChatGPT.exe`。这个 App 只在启动时读一次模型列表，关窗口没用。
 
-重开 App 并切到 **Codex 模式**，选择器里就会出现 `WB · Hy4`、`WB · GLM-5.3` 等条目，点选即可对话。
+重新打开，切到 **Codex 模式**，点开模型下拉框。你会看到 `WB · GLM-5.3 · x0.69` 这样的条目跟 GPT 排在一起。选一个，直接打字。
+
+就这样，三步，没有改配置这一环。
 
 ---
 
-## 命令
+## 模型清单
+
+每行都标了**积分倍率**，点之前就知道花多少。下面是笔者国内版订阅的实测结果；你自己的列表是从你账号实时读的，可能不一样。
+
+| 下拉框里显示 | 上下文 | 费用 |
+| --- | --- | --- |
+| `WB · Hy4 · x0.00 · 限时免费` | 960 K | 免费档 |
+| `WB · Hy4 · x0.29` | 960 K | 0.29× |
+| `WB · Hy3 · x0.00 · 限时免费` | 192 K | 免费档 |
+| `WB · Hy3 · x0.05` | 192 K | 0.05× |
+| `WB · GLM-5.3` | 1 M | 0.69× |
+| `WB · GLM-5.3-Flash` | 1 M | 0.08× |
+| `WB · GLM-5.2 · 夜间折扣` | 1 M | 0.79× |
+| `WB · DeepSeek-V4.1-Flash` | 1 M | 0.11× |
+| `WB · DeepSeek-V4-Pro` | 1 M | 0.51× |
+| `WB · Kimi-K3.1-Pro` | 1 M | 0.97× |
+| `WB · Kimi-K3` | 1 M | 1.62× |
+| `WB · Kimi-K2.8-Preview` | 1 M | 0.77× |
+| `WB · MiniMax-M3.1-Flash` | 1 M | 0.08× |
+| `WB · Space-Bunny` | 1 M | 0.08× |
+| `WB · Step-5-Preview` | 1 M | 0.33× |
+| `WB · Xiaomi MiMo-V2.6-Pro` | 1 M | 0.13× |
+
+`Hy4` 和 `Hy3` 各出现两次是**故意的**：一个是免费档，一个是计费档。同一个模型，两套计费。看价格标签就能分清。
+
+随时可以用 `node bin/wb-bridge.js models` 打印你自己的列表和实时排队状态。
+
+---
+
+## 怎么回退
+
+「回退」有两种意思，答案不一样：
+
+**「我就想用一下 GPT-4 / Jupiter / Terra。」**
+不用做任何事。下拉框里选它。网关看到请求没有 `WB/` 前缀，就原样转发给 OpenAI，用你原本的登录。你的官方订阅全程都在，网关只在用 WorkBuddy 模型时才参与。
+
+**「我要把这东西从我电脑上弄掉。」**
+
+```bash
+node bin/wb-bridge.js restore
+```
+
+然后退出重开 ChatGPT。完成。
+
+`restore` 只删它自己加的东西：从首次运行前的备份还原你的 `config.toml`、删掉生成的模型列表，不碰任何无关设置，也不碰你的登录。
+
+> 自己手改配置文件要 2–3 步，还容易改错。这是 0 步或 1 条命令。
+
+---
+
+## 网络与代理
+
+这块容易踩坑，说直白点：
+
+- **WorkBuddy 在国内**，**完全不需要代理**。开不开代理都能用。
+- **官方 GPT 模型需要代理**，这个懂的都懂，本项目改变不了。
+- **两个同时用没问题。** 网关按请求判断：WorkBuddy 模型直连，GPT 模型走你的代理。
+
+真机实测过：开代理 → 两类模型都正常；代理完全关掉 → WorkBuddy 模型照常，GPT 模型失败（符合预期）。
+
+如果你的代理设置在 Windows「Internet 选项」里，网关会自动读取。想手动指定就用环境变量 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`，优先级更高。
+
+---
+
+## 常见问题
+
+**下拉框里只有 GPT，没有 WB 开头的。**
+多半是没**完全**退出 App。关窗口不算。先用 `node bin/wb-bridge.js status` 确认状态，再把残留进程一起结束。
+
+**模型名显示成 "Custom" 而不是 `WB · …`。**
+部分桌面端版本有第二层服务端白名单，会过滤下拉框。但路由仍然是对的，请求能到正确的模型。想确认就在 `~/.codex/config.toml` 里直接写 `model = "wb/glm-5.3"` 再重启，UI 会显示 Custom 但走的确实是它。
+
+**昨天好好的，今天不行了。**
+大概率是令牌过期。重启网关，它会自动续期。如果好几个月没开过 WorkBuddy，去那边登录一次，让新凭据落盘。
+
+**我 ChatGPT 额度用完了，所有 WB 模型都变灰了。**
+这是 OpenAI 那边的规则，不是本项目的问题：原生额度耗尽后，App 会在剩余时间窗口里把其他行置灰。等重置，或者改用终端的 `codex`。
+
+**对话中途切换模型报错。**
+新建一个对话。Codex 会记录每轮的工具调用，中途换 provider 会让记录对不上。
+
+**状态栏出现「正在重新连接 5/5」。**
+v1.1.0 已修复。更新并重启即可。如果还出现，确认你跑的版本和仓库一致。
+
+其他问题：开 issue 时附上系统、Node 版本和报错原文。
+
+---
+
+## 给开发者
+
+下面是实现细节。只想用的话可以跳过。
+
+<details>
+<summary><b>为什么需要本项目（以及为什么要自己写网关）</b></summary>
+
+直接接有三个障碍：
+
+1. **协议不通。** Codex 只认 Responses API；WorkBuddy 后端是 Chat Completions 加一堆专有身份头。线上不兼容。
+2. **桌面端登录已加密。** WorkBuddy 5.6 起本地凭据文件用 AES-256-GCM 封存，只有 App 自己能解。
+3. **没有现成 provider。** [opencodex](https://opencodex.me/) 只内置了 `workbuddy-ai`（国际版订阅）。国内版没有对应 OAuth provider，而且 opencodex 的 `headers` 字段明确拒绝 `Authorization` / cookie / API key 头。
+
+本项目吸收了两个已有项目的有用部分，但打包成单个自包含进程：
+
+| 来源 | 吸收了什么 |
+| --- | --- |
+| [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) | 线上协议：凭据发现与刷新、身份头集合、会话身份三元组、请求体改写、指纹中和、目录发现、流式、错误分类。 |
+| [opencodex](https://opencodex.me/) | 回环注入策略：保留内置 provider，只注入两个根级键，发布共享目录 —— 完全可逆，不碰 `auth.json`。 |
+
+</details>
+
+<details>
+<summary><b>架构</b></summary>
+
+```
+ChatGPT 桌面端 · Codex 模式
+  │  model = wb/glm-5.3
+  ▼
+~/.codex/config.toml   →  openai_base_url = http://127.0.0.1:10100/v1
+  ▼
+workbuddy-codex-bridge   127.0.0.1:10100   （单 Node 进程，零依赖）
+  │  Responses ⇄ Chat Completions 翻译
+  │  + 凭据刷新 / 身份头 / 请求体改写
+  ├─ wb/*     → https://copilot.tencent.com/v2/chat/completions
+  └─ 其它     → https://chatgpt.com/backend-api/codex   （0 步回退）
+```
+
+网关同时实现了 Responses 的 **WebSocket** 传输。Codex 会先连 `ws://127.0.0.1:<port>/v1/responses`，早期版本每次要为此白等约 16 秒；现在完成 RFC 6455 握手就没有这段等待了。`sec-websocket-extensions` 有意不协商。
+
+</details>
+
+<details>
+<summary><b>命令</b></summary>
 
 | 命令 | 作用 |
 | --- | --- |
-| `wb-bridge start` | 发现模型 + 写目录 + 注入 config.toml + 前台运行网关（**首次用这个**） |
-| `wb-bridge setup` | 只做注入、不起服务 |
-| `wb-bridge models` | 列出账号里的 WorkBuddy 内置模型 |
-| `wb-bridge status` | 查看注入状态 / 网关是否在跑 |
-| `wb-bridge login` | 设备 OAuth 浏览器登录（没有桌面登录态时） |
-| `wb-bridge restore` | **一条命令彻底回退**到官方订阅 |
+| `wb-bridge start` | 发现、注册、注入、启动服务。平时用这个。 |
+| `wb-bridge setup` | 只注册和注入，不起服务。 |
+| `wb-bridge models` | 打印你账号的模型、费用和排队状态。 |
+| `wb-bridge status` | 注入状态、是否在监听。 |
+| `wb-bridge login` | 本地无凭据时走浏览器登录。 |
+| `wb-bridge restore` | 移除它加的所有东西。 |
 
-选项：`--port <n>`（默认 `10100`）、`--region cn|global`（默认 `cn`）。环境变量 `WB_BRIDGE_CONFIG` 指向替代配置文件。
+参数：`--port <n>`（默认 `10100`）、`--region cn|global`。
 
----
+</details>
 
-## 配置
+<details>
+<summary><b>配置</b></summary>
 
 ```jsonc
 {
-  "region": "cn",              // 或 "global"（国际版 workbuddy.ai 订阅）
+  "region": "cn",              // 国际版订阅填 "global"
   "host": "127.0.0.1",
   "port": 10100,
-  "credentialFile": "",        // 显式指定凭据文件（优先级最高）
-  "cnBase": "",                // 可选 CN 网关子域覆盖
-  "apiKey": "",                // 非空时网关要求 Authorization: Bearer <apiKey>
-  "deviceToken": "",           // 可选的真实 X-Device-Token
-  "deviceFile": "",            // 可选的设备盐文件路径
+  "credentialFile": "",        // 显式凭据路径，优先级最高
+  "cnBase": "",                // 可选：国内网关子域覆盖
+  "apiKey": "",                // 设了之后要求 Authorization: Bearer <apiKey>
+  "deviceToken": "",           // 可选：真实设备令牌
   "timeoutMs": 120000,
   "emitReasoning": true,
-  "keepModelIds": [],          // 强制保留实时目录里缺失的模型 id
-  "extraModelIds": []          // 追加你确认已开通但目录未列出的模型 id
+  "keepModelIds": [],          // 强制保留实时列表里缺失的 id
+  "extraModelIds": []          // 追加你已开通但未列出的 id
 }
 ```
 
-默认只监听回环地址。如需把端口暴露到本机之外，请设 `apiKey`。
+默认只绑定回环地址。要对内网暴露才设 `apiKey`。
 
----
+</details>
 
-## 工作原理
+<details>
+<summary><b>凭据发现顺序</b></summary>
 
-### 凭据发现
+按顺序找，命中即止：
 
-WorkBuddy 5.6 起桌面登录态被加密，因此按以下顺序查找，命中即停：
+1. `config.credentialFile` —— 显式路径。
+2. `$DSH_HOME/workbuddy-vault/<region>/*.json` —— 明文，已解密。最省事。
+3. `$DSH_HOME/.workbuddy-auth.<region>.json`，或旧版文件。
+4. `workbuddy-desktop.info` + AES-256-GCM 解密，密钥从 App 的 Electron 绑定里取。
+5. `wb-bridge login` —— 浏览器设备授权。
 
-1. `config.credentialFile` —— 显式指定；
-2. `$DSH_HOME/workbuddy-vault/<region>/*.json` —— 由 dsh-connect-workbuddy 落盘的**明文已解密**凭据（最省事，完全绕开解密）；
-3. `$DSH_HOME/.workbuddy-auth.<region>.json`，或旧版 `.workbuddy-auth.json`；
-4. `workbuddy-desktop.info` / `workbuddy-desktop-ai.info` + **AES-256-GCM** 字段解密：从 App 可执行文件的 Electron linked binding 取 `atRestSecretKey`，AAD 布局（`fieldAad`）、密钥派生（对 base64 **字符串**做 `sha256`，不是解码后的字节）与 GCM tag 校验均与参考实现一致 —— tag 不符绝不降级为截断 token；
-5. `wb-bridge login` —— 浏览器设备 OAuth（`/v2/plugin/auth/state` → 授权 → 轮询 `/v2/plugin/auth/token` → `/v2/plugin/login/account` → 每日签到）。
+令牌到期前自动刷新，以 `0600` 原子写回。企业账号通过 `X-Enterprise-Id` / `X-Tenant-Id` 支持。
 
-token 过期前自动刷新（`POST /v2/plugin/auth/token/refresh`，带 `X-Refresh-Token` 与 `X-Auth-Refresh-Source: workbuddy`，**刻意不带** `Authorization`），成功后以 `mode 0600` 原子写回。企业账号通过 `X-Enterprise-Id` / `X-Tenant-Id` 支持。
+注意这个顺序：桌面端是**最后兜底**，不是必需项。
 
-### 请求头构造
+</details>
 
-每个上游请求都带完整身份集：`X-Product`、`X-IDE-Name`、`X-IDE-Type`、`X-IDE-Version`、`X-Agent-Purpose`、`X-Domain`、`X-User-Id`、`X-Enterprise-Id`、`X-CodeBuddy-Request`、`Accept-Language`、派生的设备对（`X-Machine-ID` / `X-Session-ID`，由本地盐派生）、以及**每请求新生成**的会话身份三连（`X-Conversation-ID`、`X-Conversation-Request-ID`、`X-Conversation-Message-ID`）。三连缺任一部分都会触发上游渠道校验（`11128`），所以标识绝不复用。
+<details>
+<summary><b>线上细节</b></summary>
 
-### 请求体改写
+**请求头。** 每次上游调用都带完整身份集合（`X-Product`、`X-IDE-Type`、`X-Agent-Purpose`、`X-Domain`、派生设备对，以及新的会话身份三元组）。三元组缺任何一部分都会触发渠道门禁（`11128`），所以标识符按请求生成、从不复用。
 
-分发前统一规范化：强制 `stream: true`，`developer` 角色转 `system`，保证存在 system 头，`tool_choice` 对象收敛成后端接受的字符串形式，`max_completion_tokens` 转 `max_tokens`，删除 `reasoning_effort: "off"`（会触发 `11133`）。被上游观察为拒绝的**渠道指纹**（以产品名开头的提示句）通过在其已有空白中插入 U+200B 零宽空格来打断字节级精确匹配 —— 模型读到的文本不变。
+**请求体。** 强制 `stream: true`；`developer` → `system`；补系统头；`tool_choice` 对象收敛成后端接受的字符串；`max_completion_tokens` → `max_tokens`；去掉 `reasoning_effort: "off"`。已知的产品名指纹用 U+200B 零宽空格中和 —— 破坏字节级匹配，但不改变模型读到的文字。
 
-### 目录注入
+**工具。** Codex 把工具声明放在 `input[]` 的 `additional_tools` 项里，不是顶层 `tools` 字段。网关遍历该树、拍平 `namespace` 包装、把 `custom` 工具暴露成单字符串 `input` 的 schema，并丢弃未配对的工具调用半对 —— 上游对「有调用无结果」和「有结果无调用」都报错（`11148`）。
 
-`~/.codex/config.toml` 只接收两个根级键，且**必须位于第一个 `[table]` 之前**（TOML 结构要求 —— 插在后面会被解析进上一个表）：
+**注入。** 只加两个根级键，位置在第一个 `[table]` 之前：
 
 ```toml
 # >>> workbuddy-codex-bridge (undo: wb-bridge restore) >>>
 model_catalog_json = "/abs/path/.codex/workbuddy-catalog.json"
 openai_base_url = "http://127.0.0.1:10100/v1"
-disable_response_storage = true
 # <<< workbuddy-codex-bridge <<<
 ```
 
-目录会从 `~/.codex/models_cache.json` 克隆**全部**原生行（保证官方模型照常可用），再为每个 WorkBuddy 模型追加一行，写入真实上下文窗口、`visibility: "list"`，并把 `instructions_template` 换成中性句，避免把原生 GPT 身份文案发给 WorkBuddy 网关。注入是幂等的 —— 重复 `start` 不会产生重复块。
+目录会克隆全部原生的行（保证官方模型继续可用），再追加每个 WorkBuddy 模型一行。注入是幂等的。
 
----
+</details>
 
-## 回退到官方订阅
+<details>
+<summary><b>实测结果</b></summary>
 
-| 场景 | 步骤 |
+以下全部跑在真实国内版订阅、真实上游调用上，用的是临时 `CODEX_HOME` —— 笔者自己的 `config.toml` 全程没被改动。
+
+| 检查项 | 结果 |
 | --- | --- |
-| 临时切回官方模型 | **0 步** —— 选择器里点回任意原生 GPT，网关自动转发到官方后端 |
-| 彻底移除注入 | **1 步** —— `wb-bridge restore`，然后完全退出并重开 App |
+| 实时发现 | `/v3/config` + `/v2/enterprises/personal/models` 解析出 16 个模型，上下文 192 K–1 M |
+| 选择器内容 | `codex debug models` 报 26 行：16 个 `wb/` + 10 个原生，全部 `visibility=list` |
+| 端到端 | `codex exec -m wb/glm-5.3-flash` 输出正确，exit 0 |
+| WebSocket 传输 | 握手接受，21 帧，零重试 |
+| 修复后延迟 | 37,969 ms → 15,887 ms |
+| 工具调用 | `function_call` 参数增量正确重组 |
+| 开代理、两类模型 | WorkBuddy 200，GPT 200 |
+| 关代理 | WorkBuddy 200，GPT 失败（符合预期） |
+| GUI 选择器 | 已由用户在真实 Windows 环境确认 |
 
-`restore` 只剥离本项目自己的标记块，用首次注入前的纯净备份还原 `config.toml`，删掉生成的目录，并把 `models_cache.json` 的 `fetched_at` 置 0 迫使下次启动重读。**绝不删除你的其它 Codex 配置，也不碰 `auth.json`。**
+</details>
 
-对比「手动改 config.toml 直连第三方」需要备份/改回/重启（2–3 步），本项目把回退压到 0–1 步。
-
----
-
-## 实测记录
-
-以下结果全部用**真实 WorkBuddy 国内版订阅凭据**跑通，且全程使用临时 `CODEX_HOME`，作者真实 `~/.codex/config.toml` 未被改动（字节数始终为 4989）。
-
-| # | 验证项 | 结果 |
-| --- | --- | --- |
-| 1 | 动态模型发现 | `/v3/config` 解析出 **16 个** CN 模型，上下文 192k–1M |
-| 2 | 网关直连 `/v1/responses` | `wb/glm-5.2`、`wb/hy3`、`wb/deepseek-v4.1-flash`、`wb/minimax-m3.1-flash` 均 HTTP 200、`status=completed` |
-| 3 | 流式 SSE 事件序列 | 10 帧：`response.created` → `in_progress` → `output_item.added` → `content_part.added` → `output_text.delta` → `output_text.done` → `content_part.done` → `output_item.done` → `response.completed` → `[DONE]` |
-| 4 | 工具调用 | `tools` + `tool_choice:auto` 返回 `function_call`，增量拼接出 `{"city": "北京"}`，`call_id`/`arguments` 完整 |
-| 5 | OpenAI Chat Completions | `POST /v1/chat/completions` 返回 `object: chat.completion`、`finish_reason: stop` |
-| 6 | **Codex 实际加载目录** | `codex debug models` 看到 **26 个模型（16 个 `wb/` + 10 个原生）**，`wb/` 行全部 `visibility=list` |
-| 7 | **官方 Codex CLI 端到端** | `codex exec -m "wb/glm-5.2"` → 输出 `桥接成功`，`tokens used 1,539` |
-| 8 | 错误分类 | `hy4free` 配额耗尽返回 `code 6004 / 429` → 正确归类 `soft_rate` |
-| 9 | 自检回归 | `npm test` → 24 checks passed |
-
-**没能验证的部分（诚实说明）**：作者机器未安装 ChatGPT 桌面 App，因此**无法截图 Codex 模式图形选择器**。第 6、7 条是最接近的可得证据 —— Codex 报告它加载了 16 个 `visibility=list` 的 `wb/` 模型，且同一个 Codex 二进制成功用 `wb/glm-5.2` 完成了真实对话。桌面 App 与 CLI 共用同一套 `config.toml` + 目录读取逻辑，但 renderer 的第二层白名单（[openai/codex#19694](https://github.com/openai/codex/issues/19694)）只能在装好 App 的机器上确认。
-
-### 自检
+<details>
+<summary><b>自检</b></summary>
 
 ```bash
-npm test     # 24 passed —— 凭据/协议/正文改写/请求头/SSE/config 可逆性
+npm test     # 36 项 —— 协议、改写、请求头、SSE、WS 帧、代理、配置可逆性
 ```
 
-一半是纯函数，另一半在一次性 `CODEX_HOME` 里跑完整的 注入 → 重复注入（幂等）→ 还原 循环，并断言字节级可逆。
+一半是纯函数；另一半在临时 `CODEX_HOME` 里跑「注入 → 重复注入（幂等）→ 还原」，并断言字节级可逆。
 
----
+</details>
 
-## 已知限制
+<details>
+<summary><b>已知限制</b></summary>
 
-- **只有 Codex 模式能点选。** 普通 Chat / Work 界面没有公开的第三方模型注入方案 —— 连 Ollama 官方集成都写明 "only available in Codex mode"；opencodex 的桌面 shim 是 macOS-only、默认关闭、只过滤配额 JSON-RPC 而不路由模型调用，且因 renderer 独立 transport 失效（#6196）。
-- **选择器白名单。** 部分桌面版本有第二层远程 allowlist 会删掉本地目录里的模型（[#19694](https://github.com/openai/codex/issues/19694)、[#29156](https://github.com/openai/codex/issues/29156)）。CLI/TUI 不受影响；绕法是在 `config.toml` 直接写 `model = "wb/glm-5.2"`，UI 显示 *Custom* 但路由正确。
-- **官方 5 小时配额。** 原生配额耗尽后桌面端会把其它行置灰并强制 `gpt-reserve`（[#2813](https://github.com/openai/codex/issues/2813)）；等窗口重置，或改用 CLI。
-- **`model_catalog_json` 只在启动时加载，且覆盖（不是合并）内置目录。** 本项目克隆全部原生行来补偿，但每次改配置都必须完全退出并重开 App。
-- **上游只支持流式。** 非流式请求会被拒（`code 11101`）；网关始终流式上游，需要缓冲响应时本地聚合。
-- **Codex 会先探测 WebSocket。** 它先连 `ws://127.0.0.1:<port>/v1/responses`，重试 5 次后才回退 HTTPS —— 每次约 5 秒，并刷出一串 `failed to connect to Responses WebSocket` 日志。**属观感问题，不影响结果。** 本项目已在 upgrade 握手时立刻回 405 让回退尽早发生，但重试次数是 Codex 内部策略：`codex features list` 显示 `responses_websockets` 与 `responses_websockets_v2` 均已被标记为 `removed`，开关已不存在。
-- **协议会漂移。** 上游限流、请求头要求、内容审核变动频繁，本仓库的适配可能随时失效。
+- **仅 Codex 模式。** 没有公开办法把第三方模型塞进普通 Chat / Work 界面。连 Ollama 官方集成都写明只支持 Codex 模式。
+- **选择器白名单。** 部分版本有第二层远程白名单会过滤本地目录的行（[#19694](https://github.com/openai/codex/issues/19694)、[#29156](https://github.com/openai/codex/issues/29156)）。CLI 和 TUI 不受影响。
+- **官方 5 小时配额。** 原生额度耗尽后 App 会把其他行置灰（[#2813](https://github.com/openai/codex/issues/2813)）。
+- **`model_catalog_json` 只在启动时加载，且是替换不是合并。** 本项目克隆原生行来补偿，但每次改配置都要完全重开 App。
+- **上游只支持流式。** 非流式请求会被拒（`11101`），需要缓冲时网关本地聚合。
+- **协议会漂移。** 上游限流、头要求、内容审核随时可能变。
+
+</details>
 
 ---
 
 ## 安全
 
-- 凭据只从磁盘读入内存。明文副本以 `0600` 写入；Windows 上 POSIX 权限位无效，请把 vault 放在有 ACL 限制的目录下。
-- 网关默认只绑定 `127.0.0.1`。若绑定到其它地址，请设 `apiKey` —— 届时缺少 `Authorization: Bearer <apiKey>` 的请求会被 `401` 拒绝。
-- `X-Refresh-Token` **只**发给刷新端点，绝不出现在对话请求里。
-- 本项目对 `~/.codex/auth.json` 只读：注入与还原都不触碰它。
-- 不要把 `config.json`、凭据文件或日志提交到仓库 —— 仓库自带的 `.gitignore` 已覆盖。
-- 注入自定义目录意味着**你**要为它暴露的模型条目负责；不要把本仓库生成的目录带到你不控制的机器上。
+- 凭据只在内存。明文副本以 `0600` 写入；Windows 上请放在有 ACL 限制的目录。
+- 默认只绑回环地址；要绑得更宽就设 `apiKey`。
+- `X-Refresh-Token` 只发给刷新端点，绝不出现在对话请求里。
+- `~/.codex/auth.json` 本项目从不读写。
+- 代理流量走 `CONNECT` 隧道 —— 代理只看得到域名，看不到你的令牌和消息内容。
+- 别把 `config.json`、凭据、日志提交进仓库，`.gitignore` 已覆盖。
 
----
+## 合规
 
-## 合规与风险
+仅供**研究与互操作性学习**。与 OpenAI、腾讯、WorkBuddy、CodeBuddy 均无关联。已知风控码：`11128` 身份拒绝、`11133` 参数非法、`11140` 异常活动、`11101` 非流式、`12153` 会话失效、`402` 余额不足、`429` / `14018` 配额耗尽。网关做缓解，但缓解不等于免疫。
 
-> [!CAUTION]
-> 本项目仅供**研究与互操作性学习**。风险自负。
-
-- **上游条款。** 腾讯云将订阅限定为**交互式编程工具**使用，禁止通用 API 自动化、自定义应用后端和非交互式批量调用；违规可能导致套餐密钥被停用。把订阅喂给 ChatGPT 属于典型的第三方代理用法，确有账号被限制、套餐被终止的风险。同类项目（[workbuddy2api](https://github.com/240xu/workbuddy2api)、[workbuddy-cli-proxy](https://github.com/p2109220548-ctrl/workbuddy-cli-proxy)、[hy3-proxy](https://github.com/zhangjianqiang123/hy3-proxy)）均声明「仅供学习研究、自担风险」。
-- **无关联。** 本项目与 OpenAI、腾讯云、WorkBuddy、CodeBuddy 均无关系。所有商标归其各自所有者。
-- **已观测的风控码。** `11128` 渠道/身份拒绝、`11133` 参数非法、`11140` unusual-activity（须向上游提交反馈，重登与换模型无效）、`11101` 非流式被拒、`11102` 模型 id 未改写、`12153` session 失效、`402` 积分不足、`429` / `14018` 额度已用尽并带约 30 分钟 `Retry-After`。本项目做了规避，但规避不等于免疫。
-- **无担保。** 若账号被限制、额度被耗尽或套餐被终止，后果由使用者承担。
-
-如果无法接受这些条款，请改用官方 [TokenHub 按量 API](https://cloud.tencent.com/document/product/1823/133532) —— 那是受支持、有文档的 Codex 一等接入路径，没有上述风险。本项目之所以存在，是因为订阅本身没有受支持的编程接口。
+接受不了这些条款，就用[官方 TokenHub API](https://cloud.tencent.com/document/product/1823/133532) —— 官方支持的 Codex 接入方式，没有这些风险。
 
 ---
 
 ## 参与贡献
 
-欢迎贡献，请先读 [CONTRIBUTING.md](CONTRIBUTING.md)。
+先读 [CONTRIBUTING.md](CONTRIBUTING.md)。简单说：零依赖、每个行为变更配测试、提交 PR 前跑 `node --check`、绝不提交凭据。
 
-```bash
-git clone https://github.com/<you>/workbuddy-codex-bridge.git
-cd workbuddy-codex-bridge
-npm test
-```
+安全漏洞：见 [SECURITY.md](SECURITY.md)，请不要开公开 issue。
 
-- 保持**零运行时依赖** —— 只用 Node 内置模块。
-- 每个行为变更都要在 `test/selftest.js` 加用例，测试必须保持全绿。
-- 提交 PR 前对每个改动文件跑 `node --check`。
-- 绝不提交凭据、token、个人标识符或含上述内容的抓包。
-
-安全问题请见 [SECURITY.md](SECURITY.md)，凭据处理相关的缺陷请不要开公开 issue。
-
----
-
-## 许可证
+## 许可
 
 [MIT](LICENSE) © contributors
 
----
-
 ## 致谢
 
-- [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) —— 订阅线协议的参考实现，凭据 vault 与指纹脱敏技术的来源。
-- [opencodex](https://opencodex.me/) —— loopback 注入策略、Responses SSE 事件契约、以及模型目录克隆方法。
-- [workbuddy2api](https://github.com/240xu/workbuddy2api)、[workbuddy-cli-proxy](https://github.com/p2109220548-ctrl/workbuddy-cli-proxy)、[hy3-proxy](https://github.com/zhangjianqiang123/hy3-proxy) —— 把订阅暴露成 OpenAI 兼容端点的先行项目。
-- [Ollama × ChatGPT 集成](https://docs.ollama.com/integrations/chatgpt) —— 模型选择器机制与「自动恢复连接设置」的回退范式。
-- 腾讯云 TokenHub 文档：[Codex 接入](https://cloud.tencent.com/document/product/1823/133532)、[模型与协议矩阵](https://cloud.tencent.com/document/product/1823/130079)。
+- [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy) —— 线上协议的参考实现。
+- [opencodex](https://opencodex.me/) —— 回环注入策略与 SSE 事件契约。
+- [workbuddy2api](https://github.com/240xu/workbuddy2api)、[workbuddy-cli-proxy](https://github.com/p2109220548-ctrl/workbuddy-cli-proxy)、[hy3-proxy](https://github.com/zhangjianqiang123/hy3-proxy) —— 先行项目。
+- [Ollama × ChatGPT](https://docs.ollama.com/integrations/chatgpt) —— 选择器机制与回退思路。
+- 腾讯云文档：[Codex 接入](https://cloud.tencent.com/document/product/1823/133532)、[协议矩阵](https://cloud.tencent.com/document/product/1823/130079)。

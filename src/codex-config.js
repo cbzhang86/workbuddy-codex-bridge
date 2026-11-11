@@ -9,6 +9,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { INJECT_BEGIN, INJECT_END, BACKUP_SUFFIX, CATALOG_FILENAME, MODEL_PREFIX } from "./constants.js";
+import { busyLabel } from "./upstream.js";
 
 export function codexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
@@ -57,9 +58,19 @@ function neutralClone(template, model, index) {
   const slug = `${MODEL_PREFIX}/${model.id}`;
   const row = JSON.parse(JSON.stringify(template));
   row.slug = slug;
-  row.display_name = model.name && model.name !== model.id
-    ? `WB · ${model.name}` : `WB · ${model.id}`;
-  row.description = `WorkBuddy subscription model ${model.id} (${model.contextWindow} ctx)`;
+  // The picker renders display_name only, so the pricing badge and any promo
+  // must live there. Format mirrors dsh-connect-workbuddy:
+  //   "<name> · x0.11"  with promo badges appended as "<name> · x0.11 · 限时免费".
+  const displayName = model.name && model.name !== model.id ? model.name : model.id;
+  const parts = [`WB · ${displayName}`];
+  if (typeof model.creditMultiplier === "number") parts.push(`x${model.creditMultiplier.toFixed(2)}`);
+  for (const badge of model.badges || []) parts.push(badge);
+  row.display_name = parts.join(" · ");
+  const detail = [`WorkBuddy subscription model ${model.id}`, `${model.contextWindow} ctx`];
+  if (typeof model.creditMultiplier === "number") detail.push(`cost x${model.creditMultiplier.toFixed(2)} credits`);
+  if (model.badges?.length) detail.push(`promo: ${model.badges.join(", ")}`);
+  if (model.busyLevel) detail.push(`queue: ${busyLabel(model.busyLevel)}`);
+  row.description = detail.join(" · ");
   row.context_window = model.contextWindow || 200000;
   row.max_context_window = model.contextWindow || 200000;
   row.visibility = "list";
@@ -91,6 +102,19 @@ export function buildCatalog(models) {
   const template = native ? native[0] : neutralTemplate();
   const rows = native ? native.map((r) => JSON.parse(JSON.stringify(r))) : [JSON.parse(JSON.stringify(template))];
   const wbRows = models.map((m, i) => neutralClone(template, m, i));
+  // Several ids share a product name on purpose: hy4free/hy4std are the free and
+  // the credit-billed tier of Hy4; hy3/hy3-x likewise. They are distinct
+  // offerings, NOT duplicates, so the name must stay. The price and promo are
+  // already part of display_name, which keeps the rows distinguishable
+  // ("WB · Hy4 · x0.00 · 限时免费" vs "WB · Hy4 · x0.29"). Only fall back to the
+  // raw id if two rows would still be byte-identical.
+  const seen = new Set();
+  for (const r of wbRows) {
+    if (!seen.has(r.display_name)) { seen.add(r.display_name); continue; }
+    const id = r.slug.slice(r.slug.indexOf("/") + 1);
+    r.display_name = `${r.display_name} · ${id}`;
+    seen.add(r.display_name);
+  }
   return { models: [...rows, ...wbRows] };
 }
 
