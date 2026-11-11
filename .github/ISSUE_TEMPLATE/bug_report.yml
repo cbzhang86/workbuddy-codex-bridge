@@ -1,0 +1,59 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **Redact before submitting.** Remove `Authorization`, `X-Refresh-Token`,
+        `X-User-Id`, `X-Domain`, and any `accessToken` / `refreshToken` values.
+        Issues containing live credentials will be deleted.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The observable behaviour, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. node bin/wb-bridge.js start
+        2. pick "WB · GLM-5.2" in Codex mode
+        3. ...
+    validations:
+      required: true
+  - type: input
+    id: surface
+    attributes:
+      label: Where did it fail
+      placeholder: Codex CLI / ChatGPT desktop picker / direct curl to /v1/responses
+    validations:
+      required: true
+  - type: textarea
+    id: status
+    attributes:
+      label: Output of `wb-bridge status`
+      render: shell
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Upstream `code` and `msg` fields are the most useful part.
+      render: shell
+  - type: input
+    id: node
+    attributes:
+      label: Node version
+      placeholder: v25.8.1
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Windows, macOS, Linux]
+    validations:
+      required: true
